@@ -69,6 +69,19 @@
   flex: 1;
   overflow: auto;
   padding: 24px;
+  position: relative;
+}
+
+.export-keepalive-page {
+  height: 100%;
+
+  &.hidden {
+    display: none;
+  }
+}
+
+.export-route-anchor {
+  display: none;
 }
 
 @keyframes appFadeIn {

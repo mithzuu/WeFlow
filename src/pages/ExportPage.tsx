@@ -1831,7 +1831,7 @@ function ExportPage() {
         {!showInitialSkeleton && (isLoading || isSessionEnriching) && (
           <div className="table-stage-hint">
             <Loader2 size={14} className="spin" />
-            {isLoading ? '正在刷新会话列表…' : '正在补充头像和统计…'}
+            {isLoading ? '导出板块数据加载中…' : '正在补充头像和统计…'}
           </div>
         )}
 

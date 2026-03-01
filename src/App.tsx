@@ -61,7 +61,9 @@ function App() {
   const isVideoPlayerWindow = location.pathname === '/video-player-window'
   const isChatHistoryWindow = location.pathname.startsWith('/chat-history/')
   const isNotificationWindow = location.pathname === '/notification-window'
+  const isExportRoute = location.pathname === '/export'
   const [themeHydrated, setThemeHydrated] = useState(false)
+  const [hasVisitedExport, setHasVisitedExport] = useState(isExportRoute)
 
   // 锁定状态
   // const [isLocked, setIsLocked] = useState(false) // Moved to store
@@ -98,6 +100,12 @@ function App() {
       }
     }
   }, [isOnboardingWindow])
+
+  useEffect(() => {
+    if (isExportRoute) {
+      setHasVisitedExport(true)
+    }
+  }, [isExportRoute])
 
   // 应用主题
   useEffect(() => {
@@ -454,6 +462,12 @@ function App() {
         <Sidebar />
         <main className="content">
           <RouteGuard>
+            {hasVisitedExport && (
+              <div className={`export-keepalive-page ${isExportRoute ? 'active' : 'hidden'}`} aria-hidden={!isExportRoute}>
+                <ExportPage />
+              </div>
+            )}
+
             <Routes>
               <Route path="/" element={<HomePage />} />
               <Route path="/home" element={<HomePage />} />
@@ -468,7 +482,7 @@ function App() {
               <Route path="/dual-report/view" element={<DualReportWindow />} />
 
               <Route path="/settings" element={<SettingsPage />} />
-              <Route path="/export" element={<ExportPage />} />
+              <Route path="/export" element={<div className="export-route-anchor" aria-hidden="true" />} />
               <Route path="/sns" element={<SnsPage />} />
               <Route path="/contacts" element={<ContactsPage />} />
               <Route path="/chat-history/:sessionId/:messageId" element={<ChatHistoryPage />} />
