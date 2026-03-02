@@ -105,7 +105,7 @@ export class ConfigService {
         whisperDownloadSource: 'tsinghua',
         autoTranscribeVoice: false,
         transcribeLanguages: ['zh'],
-        exportDefaultConcurrency: 2,
+        exportDefaultConcurrency: 4,
         analyticsExcludedUsernames: [],
         authEnabled: false,
         authPassword: '',

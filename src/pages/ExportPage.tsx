@@ -620,7 +620,7 @@ function ExportPage() {
     excelCompactColumns: true,
     txtColumns: defaultTxtColumns,
     displayNamePreference: 'remark',
-    exportConcurrency: 2
+    exportConcurrency: 4
   })
 
   const [exportDialog, setExportDialog] = useState<ExportDialogState>({

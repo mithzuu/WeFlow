@@ -108,7 +108,7 @@ function SettingsPage() {
   const [exportDefaultMedia, setExportDefaultMedia] = useState(false)
   const [exportDefaultVoiceAsText, setExportDefaultVoiceAsText] = useState(false)
   const [exportDefaultExcelCompactColumns, setExportDefaultExcelCompactColumns] = useState(true)
-  const [exportDefaultConcurrency, setExportDefaultConcurrency] = useState(2)
+  const [exportDefaultConcurrency, setExportDefaultConcurrency] = useState(4)
 
   const [notificationEnabled, setNotificationEnabled] = useState(true)
   const [notificationPosition, setNotificationPosition] = useState<'top-right' | 'top-left' | 'bottom-right' | 'bottom-left'>('top-right')
@@ -332,7 +332,7 @@ function SettingsPage() {
       setExportDefaultMedia(savedExportDefaultMedia ?? false)
       setExportDefaultVoiceAsText(savedExportDefaultVoiceAsText ?? false)
       setExportDefaultExcelCompactColumns(savedExportDefaultExcelCompactColumns ?? true)
-      setExportDefaultConcurrency(savedExportDefaultConcurrency ?? 2)
+      setExportDefaultConcurrency(savedExportDefaultConcurrency ?? 4)
 
       setNotificationEnabled(savedNotificationEnabled)
       setNotificationPosition(savedNotificationPosition)
