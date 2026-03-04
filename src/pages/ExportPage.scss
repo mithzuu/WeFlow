@@ -1009,6 +1009,9 @@
 
   .meta-item.syncing {
     color: var(--primary);
+    display: inline-flex;
+    align-items: center;
+    gap: 4px;
   }
 }
 
@@ -1329,6 +1332,37 @@
     background: var(--bg-secondary);
     color: var(--text-secondary);
     flex-shrink: 0;
+  }
+
+  .row-message-count {
+    min-width: 82px;
+    display: flex;
+    flex-direction: column;
+    align-items: flex-end;
+    gap: 2px;
+    flex-shrink: 0;
+    text-align: right;
+  }
+
+  .row-message-count-label {
+    font-size: 11px;
+    color: var(--text-tertiary);
+    line-height: 1;
+  }
+
+  .row-message-count-value {
+    margin: 0;
+    font-size: 13px;
+    line-height: 1.2;
+    color: var(--text-primary);
+    font-weight: 600;
+    font-variant-numeric: tabular-nums;
+
+    &.muted {
+      font-size: 12px;
+      font-weight: 500;
+      color: var(--text-tertiary);
+    }
   }
 }
 
@@ -2246,6 +2280,14 @@
 }
 
 @media (max-width: 720px) {
+  .table-wrap .row-message-count {
+    min-width: 66px;
+  }
+
+  .table-wrap .row-message-count-label {
+    display: none;
+  }
+
   .diag-panel-header {
     flex-direction: column;
     align-items: stretch;

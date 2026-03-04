@@ -780,6 +780,12 @@ const toSessionRowsWithContacts = (
     .sort((a, b) => (b.sortTimestamp || b.lastTimestamp || 0) - (a.sortTimestamp || a.lastTimestamp || 0))
 }
 
+const normalizeMessageCount = (value: unknown): number | undefined => {
+  const parsed = Number(value)
+  if (!Number.isFinite(parsed) || parsed < 0) return undefined
+  return Math.floor(parsed)
+}
+
 const WriteLayoutSelector = memo(function WriteLayoutSelector({
   writeLayout,
   onChange
@@ -856,6 +862,8 @@ function ExportPage() {
   const [contactsDataSource, setContactsDataSource] = useState<ContactsDataSource>(null)
   const [contactsUpdatedAt, setContactsUpdatedAt] = useState<number | null>(null)
   const [avatarCacheUpdatedAt, setAvatarCacheUpdatedAt] = useState<number | null>(null)
+  const [sessionMessageCounts, setSessionMessageCounts] = useState<Record<string, number>>({})
+  const [isLoadingSessionCounts, setIsLoadingSessionCounts] = useState(false)
   const [contactsListScrollTop, setContactsListScrollTop] = useState(0)
   const [contactsListViewportHeight, setContactsListViewportHeight] = useState(480)
   const [contactsLoadTimeoutMs, setContactsLoadTimeoutMs] = useState(DEFAULT_CONTACTS_LOAD_TIMEOUT_MS)
@@ -945,6 +953,8 @@ function ExportPage() {
   const inProgressSessionIdsRef = useRef<string[]>([])
   const activeTaskCountRef = useRef(0)
   const hasBaseConfigReadyRef = useRef(false)
+  const sessionCountRequestIdRef = useRef(0)
+  const activeTabRef = useRef<ConversationTab>('private')
 
   const appendFrontendDiagLog = useCallback((entry: ExportCardDiagLogEntry) => {
     setFrontendDiagLogs(prev => {
@@ -1387,11 +1397,84 @@ function ExportPage() {
     }
   }, [])
 
+  const loadSessionMessageCounts = useCallback(async (
+    sourceSessions: SessionRow[],
+    priorityTab: ConversationTab
+  ) => {
+    const requestId = sessionCountRequestIdRef.current + 1
+    sessionCountRequestIdRef.current = requestId
+    const isStale = () => sessionCountRequestIdRef.current !== requestId
+
+    const exportableSessions = sourceSessions.filter(session => session.hasSession)
+    const seededHintCounts = exportableSessions.reduce<Record<string, number>>((acc, session) => {
+      const nextCount = normalizeMessageCount(session.messageCountHint)
+      if (typeof nextCount === 'number') {
+        acc[session.username] = nextCount
+      }
+      return acc
+    }, {})
+    setSessionMessageCounts(seededHintCounts)
+
+    if (exportableSessions.length === 0) {
+      setIsLoadingSessionCounts(false)
+      return
+    }
+
+    const prioritizedSessionIds = exportableSessions
+      .filter(session => session.kind === priorityTab)
+      .map(session => session.username)
+    const prioritizedSet = new Set(prioritizedSessionIds)
+    const remainingSessionIds = exportableSessions
+      .filter(session => !prioritizedSet.has(session.username))
+      .map(session => session.username)
+
+    const applyCounts = (input: Record<string, number> | undefined) => {
+      if (!input || isStale()) return
+      const normalized = Object.entries(input).reduce<Record<string, number>>((acc, [sessionId, count]) => {
+        const nextCount = normalizeMessageCount(count)
+        if (typeof nextCount === 'number') {
+          acc[sessionId] = nextCount
+        }
+        return acc
+      }, {})
+      if (Object.keys(normalized).length === 0) return
+      setSessionMessageCounts(prev => ({ ...prev, ...normalized }))
+    }
+
+    setIsLoadingSessionCounts(true)
+    try {
+      if (prioritizedSessionIds.length > 0) {
+        const priorityResult = await window.electronAPI.chat.getSessionMessageCounts(prioritizedSessionIds)
+        if (isStale()) return
+        if (priorityResult.success) {
+          applyCounts(priorityResult.counts)
+        }
+      }
+
+      if (remainingSessionIds.length > 0) {
+        const remainingResult = await window.electronAPI.chat.getSessionMessageCounts(remainingSessionIds)
+        if (isStale()) return
+        if (remainingResult.success) {
+          applyCounts(remainingResult.counts)
+        }
+      }
+    } catch (error) {
+      console.error('导出页加载会话消息总数失败:', error)
+    } finally {
+      if (!isStale()) {
+        setIsLoadingSessionCounts(false)
+      }
+    }
+  }, [])
+
   const loadSessions = useCallback(async () => {
     const loadToken = Date.now()
     sessionLoadTokenRef.current = loadToken
     setIsLoading(true)
     setIsSessionEnriching(false)
+    sessionCountRequestIdRef.current += 1
+    setSessionMessageCounts({})
+    setIsLoadingSessionCounts(false)
 
     const isStale = () => sessionLoadTokenRef.current !== loadToken
 
@@ -1433,6 +1516,7 @@ function ExportPage() {
 
         if (isStale()) return
         setSessions(baseSessions)
+        void loadSessionMessageCounts(baseSessions, activeTabRef.current)
         setSessionDataSource(cachedContacts.length > 0 ? 'cache' : 'network')
         if (cachedContacts.length === 0) {
           setSessionContactsUpdatedAt(Date.now())
@@ -1620,7 +1704,7 @@ function ExportPage() {
     } finally {
       if (!isStale()) setIsLoading(false)
     }
-  }, [ensureExportCacheScope, loadContactsCaches, syncContactTypeCounts])
+  }, [ensureExportCacheScope, loadContactsCaches, loadSessionMessageCounts, syncContactTypeCounts])
 
   useEffect(() => {
     if (!isExportRoute) return
@@ -1649,8 +1733,14 @@ function ExportPage() {
     if (isExportRoute) return
     // 导出页隐藏时停止后台联系人补齐请求，避免与通讯录页面查询抢占。
     sessionLoadTokenRef.current = Date.now()
+    sessionCountRequestIdRef.current += 1
     setIsSessionEnriching(false)
+    setIsLoadingSessionCounts(false)
   }, [isExportRoute])
+
+  useEffect(() => {
+    activeTabRef.current = activeTab
+  }, [activeTab])
 
   useEffect(() => {
     preselectAppliedRef.current = false
@@ -3783,6 +3873,12 @@ function ExportPage() {
           {isContactsListLoading && contactsList.length > 0 && (
             <span className="meta-item syncing">后台同步中...</span>
           )}
+          {isLoadingSessionCounts && (
+            <span className="meta-item syncing">
+              <Loader2 size={12} className="spin" />
+              消息总数统计中…
+            </span>
+          )}
         </div>
 
         {contactsList.length > 0 && isContactsListLoading && (
@@ -3850,6 +3946,14 @@ function ExportPage() {
                     const isQueued = canExport && queuedSessionIds.has(contact.username)
                     const isPaused = canExport && pausedSessionIds.has(contact.username)
                     const recent = canExport ? formatRecentExportTime(lastExportBySession[contact.username], nowTick) : ''
+                    const countedMessages = normalizeMessageCount(sessionMessageCounts[contact.username])
+                    const hintedMessages = normalizeMessageCount(matchedSession?.messageCountHint)
+                    const displayedMessageCount = countedMessages ?? hintedMessages
+                    const messageCountLabel = !canExport
+                      ? '--'
+                      : typeof displayedMessageCount === 'number'
+                        ? displayedMessageCount.toLocaleString('zh-CN')
+                        : (isLoadingSessionCounts ? '统计中…' : '--')
                     return (
                       <div
                         key={contact.username}
@@ -3870,6 +3974,12 @@ function ExportPage() {
                           </div>
                           <div className={`contact-type ${contact.type}`}>
                             <span>{getContactTypeName(contact.type)}</span>
+                          </div>
+                          <div className="row-message-count">
+                            <span className="row-message-count-label">总消息</span>
+                            <strong className={`row-message-count-value ${typeof displayedMessageCount === 'number' ? '' : 'muted'}`}>
+                              {messageCountLabel}
+                            </strong>
                           </div>
                           <div className="row-action-cell">
                             <div className="row-action-main">
