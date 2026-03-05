@@ -64,7 +64,8 @@ export const CONFIG_KEYS = {
   WORD_CLOUD_EXCLUDE_WORDS: 'wordCloudExcludeWords',
 
   // 数据收集
-  ANALYTICS_CONSENT: 'analyticsConsent'
+  ANALYTICS_CONSENT: 'analyticsConsent',
+  ANALYTICS_DENY_COUNT: 'analyticsDenyCount'
 } as const
 
 export interface WxidConfig {
@@ -1097,4 +1098,15 @@ export async function getAnalyticsConsent(): Promise<boolean | null> {
 // 设置数据收集同意状态
 export async function setAnalyticsConsent(consent: boolean): Promise<void> {
   await config.set(CONFIG_KEYS.ANALYTICS_CONSENT, consent)
+}
+
+// 获取数据收集拒绝次数
+export async function getAnalyticsDenyCount(): Promise<number> {
+  const value = await config.get(CONFIG_KEYS.ANALYTICS_DENY_COUNT)
+  return typeof value === 'number' ? value : 0
+}
+
+// 设置数据收集拒绝次数
+export async function setAnalyticsDenyCount(count: number): Promise<void> {
+  await config.set(CONFIG_KEYS.ANALYTICS_DENY_COUNT, count)
 }

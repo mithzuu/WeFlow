@@ -35,7 +35,7 @@ class CloudControlService {
   private async reportOnline() {
     const data: UsageStats = {
       appVersion: app.getVersion(),
-      platform: process.platform,
+      platform: this.getPlatformVersion(),
       deviceId: this.deviceId,
       timestamp: Date.now(),
       online: true,
@@ -44,6 +44,29 @@ class CloudControlService {
 
     await wcdbService.cloudReport(JSON.stringify(data))
     this.pages.clear()
+  }
+
+  private getPlatformVersion(): string {
+    const os = require('os')
+    const platform = process.platform
+
+    if (platform === 'win32') {
+      const release = os.release()
+      const parts = release.split('.')
+      const major = parseInt(parts[0])
+      const minor = parseInt(parts[1] || '0')
+      const build = parseInt(parts[2] || '0')
+
+      // Windows 11 是 10.0.22000+，且主版本必须是 10.0
+      if (major === 10 && minor === 0 && build >= 22000) {
+        return 'Windows 11'
+      } else if (major === 10) {
+        return 'Windows 10'
+      }
+      return `Windows ${release}`
+    }
+
+    return platform
   }
 
   recordPage(pageName: string) {

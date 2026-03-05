@@ -121,6 +121,9 @@ function SettingsPage() {
   const [wordCloudExcludeWords, setWordCloudExcludeWords] = useState<string[]>([])
   const [excludeWordsInput, setExcludeWordsInput] = useState('')
 
+  // 数据收集同意状态
+  const [analyticsConsent, setAnalyticsConsent] = useState<boolean>(false)
+
 
 
 
@@ -342,6 +345,9 @@ function SettingsPage() {
       const savedExcludeWords = await configService.getWordCloudExcludeWords()
       setWordCloudExcludeWords(savedExcludeWords)
       setExcludeWordsInput(savedExcludeWords.join('\n'))
+
+      const savedAnalyticsConsent = await configService.getAnalyticsConsent()
+      setAnalyticsConsent(savedAnalyticsConsent ?? false)
 
       // 如果语言列表为空，保存默认值
       if (!savedTranscribeLanguages || savedTranscribeLanguages.length === 0) {
@@ -2313,6 +2319,24 @@ function SettingsPage() {
           <a href="#" onClick={(e) => { e.preventDefault(); window.electronAPI.window.openAgreementWindow() }}>用户协议</a>
         </div>
         <p className="copyright">© 2025 WeFlow. All rights reserved.</p>
+
+        <div className="log-toggle-line" style={{ marginTop: '16px', justifyContent: 'center' }}>
+          <span style={{ fontSize: '13px', opacity: 0.7 }}>匿名数据收集</span>
+          <label className="switch">
+            <input
+              type="checkbox"
+              className="switch-input"
+              checked={analyticsConsent}
+              onChange={async (e) => {
+                const consent = e.target.checked
+                setAnalyticsConsent(consent)
+                await configService.setAnalyticsConsent(consent)
+                showMessage(consent ? '已允许数据收集' : '已拒绝数据收集', true)
+              }}
+            />
+            <span className="switch-slider"></span>
+          </label>
+        </div>
       </div>
     </div>
   )

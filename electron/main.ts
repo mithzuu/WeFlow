@@ -2372,6 +2372,13 @@ app.whenReady().then(async () => {
   })
 })
 
+app.on('before-quit', async () => {
+  // 停止 HTTP 服务器，释放 TCP 端口占用，避免进程无法退出
+  try { await httpService.stop() } catch {}
+  // 终止 wcdb Worker 线程，避免线程阻止进程退出
+  try { wcdbService.shutdown() } catch {}
+})
+
 app.on('window-all-closed', () => {
   if (process.platform !== 'darwin') {
     app.quit()

@@ -179,7 +179,9 @@ function App() {
         } else {
           // 协议已同意，检查数据收集同意状态
           const consent = await configService.getAnalyticsConsent()
-          if (consent === null) {
+          const denyCount = await configService.getAnalyticsDenyCount()
+          // 如果未设置同意状态且拒绝次数小于2次，显示弹窗
+          if (consent === null && denyCount < 2) {
             setShowAnalyticsConsent(true)
           }
         }
@@ -226,8 +228,9 @@ function App() {
   }
 
   const handleAnalyticsDeny = async () => {
-    await configService.setAnalyticsConsent(false)
-    window.electronAPI.window.close()
+    const denyCount = await configService.getAnalyticsDenyCount()
+    await configService.setAnalyticsDenyCount(denyCount + 1)
+    setShowAnalyticsConsent(false)
   }
 
   // 监听启动时的更新通知
