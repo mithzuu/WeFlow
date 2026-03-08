@@ -143,8 +143,13 @@ export class WcdbCore {
     }
   }
 
-  // 使用命名管道 IPC
+  // 使用命名管道 IPC (仅 Windows)
   startMonitor(callback: (type: string, json: string) => void): boolean {
+    if (process.platform !== 'win32') {
+      console.warn('[wcdbCore] Monitor not supported on macOS')
+      return false
+    }
+    
     if (!this.wcdbStartMonitorPipe) {
       return false
     }
@@ -251,9 +256,13 @@ export class WcdbCore {
 
 
   /**
-   * 获取 DLL 路径
+   * 获取库文件路径（跨平台）
    */
   private getDllPath(): string {
+    const isMac = process.platform === 'darwin'
+    const libName = isMac ? 'libwcdb_api.dylib' : 'wcdb_api.dll'
+    const subDir = isMac ? 'macos' : ''
+    
     const envDllPath = process.env.WCDB_DLL_PATH
     if (envDllPath && envDllPath.length > 0) {
       return envDllPath
@@ -265,22 +274,22 @@ export class WcdbCore {
 
     const candidates = [
       // 环境变量指定 resource 目录
-      process.env.WCDB_RESOURCES_PATH ? join(process.env.WCDB_RESOURCES_PATH, 'wcdb_api.dll') : null,
+      process.env.WCDB_RESOURCES_PATH ? join(process.env.WCDB_RESOURCES_PATH, subDir, libName) : null,
       // 显式 setPaths 设置的路径
-      this.resourcesPath ? join(this.resourcesPath, 'wcdb_api.dll') : null,
-      // text/resources/wcdb_api.dll (打包常见结构)
-      join(resourcesPath, 'resources', 'wcdb_api.dll'),
-      // items/resourcesPath/wcdb_api.dll (扁平结构)
-      join(resourcesPath, 'wcdb_api.dll'),
+      this.resourcesPath ? join(this.resourcesPath, subDir, libName) : null,
+      // resources/macos/libwcdb_api.dylib 或 resources/wcdb_api.dll
+      join(resourcesPath, 'resources', subDir, libName),
+      // resources/libwcdb_api.dylib 或 resources/wcdb_api.dll (扁平结构)
+      join(resourcesPath, subDir, libName),
       // CWD fallback
-      join(process.cwd(), 'resources', 'wcdb_api.dll')
+      join(process.cwd(), 'resources', subDir, libName)
     ].filter(Boolean) as string[]
 
     for (const path of candidates) {
       if (existsSync(path)) return path
     }
 
-    return candidates[0] || 'wcdb_api.dll'
+    return candidates[0] || libName
   }
 
   private isLogEnabled(): boolean {
@@ -392,24 +401,40 @@ export class WcdbCore {
       }
 
       const dllDir = dirname(dllPath)
-      const wcdbCorePath = join(dllDir, 'WCDB.dll')
-      if (existsSync(wcdbCorePath)) {
-        try {
-          this.koffi.load(wcdbCorePath)
-          this.writeLog('预加载 WCDB.dll 成功')
-        } catch (e) {
-          console.warn('预加载 WCDB.dll 失败(可能不是致命的):', e)
-          this.writeLog(`预加载 WCDB.dll 失败: ${String(e)}`)
+      const isMac = process.platform === 'darwin'
+      
+      // 预加载依赖库
+      if (isMac) {
+        const wcdbCorePath = join(dllDir, 'libWCDB.dylib')
+        if (existsSync(wcdbCorePath)) {
+          try {
+            this.koffi.load(wcdbCorePath)
+            this.writeLog('预加载 libWCDB.dylib 成功')
+          } catch (e) {
+            console.warn('预加载 libWCDB.dylib 失败(可能不是致命的):', e)
+            this.writeLog(`预加载 libWCDB.dylib 失败: ${String(e)}`)
+          }
         }
-      }
-      const sdl2Path = join(dllDir, 'SDL2.dll')
-      if (existsSync(sdl2Path)) {
-        try {
-          this.koffi.load(sdl2Path)
-          this.writeLog('预加载 SDL2.dll 成功')
-        } catch (e) {
-          console.warn('预加载 SDL2.dll 失败(可能不是致命的):', e)
-          this.writeLog(`预加载 SDL2.dll 失败: ${String(e)}`)
+      } else {
+        const wcdbCorePath = join(dllDir, 'WCDB.dll')
+        if (existsSync(wcdbCorePath)) {
+          try {
+            this.koffi.load(wcdbCorePath)
+            this.writeLog('预加载 WCDB.dll 成功')
+          } catch (e) {
+            console.warn('预加载 WCDB.dll 失败(可能不是致命的):', e)
+            this.writeLog(`预加载 WCDB.dll 失败: ${String(e)}`)
+          }
+        }
+        const sdl2Path = join(dllDir, 'SDL2.dll')
+        if (existsSync(sdl2Path)) {
+          try {
+            this.koffi.load(sdl2Path)
+            this.writeLog('预加载 SDL2.dll 成功')
+          } catch (e) {
+            console.warn('预加载 SDL2.dll 失败(可能不是致命的):', e)
+            this.writeLog(`预加载 SDL2.dll 失败: ${String(e)}`)
+          }
         }
       }
 
