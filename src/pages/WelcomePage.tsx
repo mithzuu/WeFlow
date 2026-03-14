@@ -780,9 +780,6 @@ function WelcomePage({ standalone = false }: WelcomePageProps) {
 
             {currentStep.id === 'image' && (
               <div className="form-group">
-                <div className="field-hint" style={{ color: '#f59e0b', marginBottom: '12px' }}>
-                  ⚠️ 快速获取方案基于本地缓存计算，可能因账号信息不匹配而不准确。若图片无法解密，请使用下方「内存扫描」方案。
-                </div>
                 <div className="grid-2">
                   <div>
                     <label className="field-label">图片 XOR 密钥</label>
@@ -795,11 +792,11 @@ function WelcomePage({ standalone = false }: WelcomePageProps) {
                 </div>
 
                 <div style={{ display: 'flex', gap: '8px', marginTop: '16px' }}>
-                  <button className="btn btn-secondary btn-block" onClick={handleAutoGetImageKey} disabled={isFetchingImageKey} title="从本地缓存快速计算（可能不准确）">
-                    {isFetchingImageKey ? '获取中...' : '快速获取（缓存计算）'}
+                  <button className="btn btn-primary btn-block" onClick={handleAutoGetImageKey} disabled={isFetchingImageKey} title="从本地缓存快速计算">
+                    {isFetchingImageKey ? '获取中...' : '缓存计算（推荐）'}
                   </button>
-                  <button className="btn btn-primary btn-block" onClick={handleScanImageKeyFromMemory} disabled={isFetchingImageKey} title="扫描微信进程内存，准确率更高，需要微信正在运行">
-                    {isFetchingImageKey ? '扫描中...' : '内存扫描（推荐）'}
+                  <button className="btn btn-secondary btn-block" onClick={handleScanImageKeyFromMemory} disabled={isFetchingImageKey} title="扫描微信进程内存">
+                    {isFetchingImageKey ? '扫描中...' : '内存扫描'}
                   </button>
                 </div>
 
@@ -813,7 +810,7 @@ function WelcomePage({ standalone = false }: WelcomePageProps) {
                   imageKeyStatus && <div className="status-message" style={{ marginTop: '12px' }}>{imageKeyStatus}</div>
                 )}
 
-                <div className="field-hint" style={{ marginTop: '8px' }}>内存扫描需要微信正在运行，并在微信中打开 2-3 张图片大图后再点击</div>
+                <div className="field-hint" style={{ marginTop: '8px' }}>优先推荐缓存计算方案。若图片无法解密，可使用内存扫描（需微信运行并打开 2-3 张图片大图）</div>
               </div>
             )}
           </div>

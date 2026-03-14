@@ -2,6 +2,7 @@ import { useState, useEffect, useRef, useCallback } from 'react'
 import { useSearchParams } from 'react-router-dom'
 import { ZoomIn, ZoomOut, RotateCw, RotateCcw } from 'lucide-react'
 import { LivePhotoIcon } from '../components/LivePhotoIcon'
+import TitleBar from '../components/TitleBar'
 import './ImageWindow.scss'
 
 export default function ImageWindow() {
@@ -207,31 +208,35 @@ export default function ImageWindow() {
 
     return (
         <div className="image-window-container">
-            <div className="title-bar">
-                <div className="window-drag-area"></div>
-                <div className="title-bar-controls">
-                    {hasLiveVideo && (
-                        <>
-                            <button
-                                onClick={handlePlayLiveVideo}
-                                title={isPlayingLive ? '正在播放实况' : '播放实况 (空格)'}
-                                className={`live-play-btn ${isPlayingLive ? 'active' : ''}`}
-                                disabled={isPlayingLive}
-                            >
-                                <LivePhotoIcon size={16} />
-                                <span style={{ fontSize: 13, marginLeft: 4 }}>Live</span>
-                            </button>
-                            <div className="divider"></div>
-                        </>
-                    )}
-                    <button onClick={handleZoomOut} title="缩小 (-)"><ZoomOut size={16} /></button>
-                    <span className="scale-text">{Math.round(displayScale * 100)}%</span>
-                    <button onClick={handleZoomIn} title="放大 (+)"><ZoomIn size={16} /></button>
-                    <div className="divider"></div>
-                    <button onClick={handleRotateCcw} title="逆时针旋转"><RotateCcw size={16} /></button>
-                    <button onClick={handleRotate} title="顺时针旋转 (R)"><RotateCw size={16} /></button>
-                </div>
-            </div>
+            <TitleBar
+                title="图片查看"
+                showWindowControls={true}
+                showLogo={false}
+                customControls={
+                    <div className="image-controls">
+                        {hasLiveVideo && (
+                            <>
+                                <button
+                                    onClick={handlePlayLiveVideo}
+                                    title={isPlayingLive ? '正在播放实况' : '播放实况 (空格)'}
+                                    className={`live-play-btn ${isPlayingLive ? 'active' : ''}`}
+                                    disabled={isPlayingLive}
+                                >
+                                    <LivePhotoIcon size={16} />
+                                    <span style={{ fontSize: 13, marginLeft: 4 }}>Live</span>
+                                </button>
+                                <div className="divider"></div>
+                            </>
+                        )}
+                        <button onClick={handleZoomOut} title="缩小 (-)"><ZoomOut size={16} /></button>
+                        <span className="scale-text">{Math.round(displayScale * 100)}%</span>
+                        <button onClick={handleZoomIn} title="放大 (+)"><ZoomIn size={16} /></button>
+                        <div className="divider"></div>
+                        <button onClick={handleRotateCcw} title="逆时针旋转"><RotateCcw size={16} /></button>
+                        <button onClick={handleRotate} title="顺时针旋转 (R)"><RotateCw size={16} /></button>
+                    </div>
+                }
+            />
 
             <div
                 className="image-viewport"

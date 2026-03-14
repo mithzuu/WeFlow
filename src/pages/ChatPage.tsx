@@ -2981,8 +2981,8 @@ function ChatPage(props: ChatPageProps) {
     if (hasFoldedGroups && !visible.some(s => s.username.toLowerCase().includes('placeholder_foldgroup'))) {
       // 找到最新的折叠消息
       const latestFolded = foldedGroups.reduce((latest, current) => {
-        const latestTime = latest.sortTimestamp || latest.lastTimestamp || latest.timestamp
-        const currentTime = current.sortTimestamp || current.lastTimestamp || current.timestamp
+        const latestTime = latest.sortTimestamp || latest.lastTimestamp
+        const currentTime = current.sortTimestamp || current.lastTimestamp
         return currentTime > latestTime ? current : latest
       })
 
@@ -2990,19 +2990,19 @@ function ChatPage(props: ChatPageProps) {
         username: 'placeholder_foldgroup',
         displayName: '折叠的聊天',
         summary: `${latestFolded.displayName || latestFolded.username}: ${latestFolded.summary}`,
-        timestamp: latestFolded.timestamp,
-        sortTimestamp: latestFolded.sortTimestamp || latestFolded.lastTimestamp || latestFolded.timestamp,
-        lastTimestamp: latestFolded.lastTimestamp || latestFolded.sortTimestamp || latestFolded.timestamp,
+        type: 0,
+        sortTimestamp: latestFolded.sortTimestamp || latestFolded.lastTimestamp,
+        lastTimestamp: latestFolded.lastTimestamp || latestFolded.sortTimestamp,
+        lastMsgType: 0,
         unreadCount: foldedGroups.reduce((sum, s) => sum + (s.unreadCount || 0), 0),
         isMuted: false,
-        isFolded: false,
-        isGroup: true
+        isFolded: false
       }
 
       // 按时间戳插入到正确位置
-      const foldTime = foldEntry.sortTimestamp || foldEntry.lastTimestamp || foldEntry.timestamp
+      const foldTime = foldEntry.sortTimestamp || foldEntry.lastTimestamp
       const insertIndex = visible.findIndex(s => {
-        const sTime = s.sortTimestamp || s.lastTimestamp || s.timestamp
+        const sTime = s.sortTimestamp || s.lastTimestamp
         return sTime < foldTime
       })
       if (insertIndex === -1) {

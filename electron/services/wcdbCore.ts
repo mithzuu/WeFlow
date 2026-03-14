@@ -190,8 +190,7 @@ export class WcdbCore {
     setTimeout(() => {
       if (!this.monitorCallback) return
 
-      this.monitorPipeClient = net.createConnection(this.monitorPipePath, () => {
-      })
+      this.monitorPipeClient = net.createConnection(this.monitorPipePath, () => {})
 
       let buffer = ''
       this.monitorPipeClient.on('data', (data: Buffer) => {
@@ -210,8 +209,7 @@ export class WcdbCore {
         }
       })
 
-      this.monitorPipeClient.on('error', () => {
-      })
+      this.monitorPipeClient.on('error', () => {})
 
       this.monitorPipeClient.on('close', () => {
         this.monitorPipeClient = null

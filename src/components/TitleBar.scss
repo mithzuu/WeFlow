@@ -36,6 +36,8 @@
   font-size: 15px;
   font-weight: 500;
   color: var(--text-secondary);
+  -webkit-font-smoothing: antialiased;
+  -moz-osx-font-smoothing: grayscale;
 }
 
 .title-sidebar-toggle {
@@ -88,5 +90,57 @@
   &.is-close:hover {
     background: #e5484d;
     color: #fff;
+  }
+}
+
+.image-controls {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  margin-right: auto;
+  padding-left: 16px;
+  -webkit-app-region: no-drag;
+
+  button {
+    background: transparent;
+    border: none;
+    color: var(--text-secondary);
+    cursor: pointer;
+    padding: 6px;
+    border-radius: 4px;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    transition: all 0.2s;
+
+    &:hover {
+      background: var(--bg-tertiary);
+      color: var(--text-primary);
+    }
+
+    &:disabled {
+      cursor: default;
+      opacity: 1;
+    }
+
+    &.live-play-btn.active {
+      background: rgba(var(--primary-rgb, 76, 132, 255), 0.16);
+      color: var(--primary, #4c84ff);
+    }
+  }
+
+  .scale-text {
+    min-width: 50px;
+    text-align: center;
+    color: var(--text-secondary);
+    font-size: 12px;
+    font-variant-numeric: tabular-nums;
+  }
+
+  .divider {
+    width: 1px;
+    height: 14px;
+    background: var(--border-color);
+    margin: 0 4px;
   }
 }

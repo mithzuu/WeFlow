@@ -660,16 +660,13 @@ function createImageViewerWindow(imagePath: string, liveVideoPath?: string) {
       nodeIntegration: false,
       webSecurity: false // 允许加载本地文件
     },
-    titleBarStyle: 'hidden',
-    titleBarOverlay: {
-      color: '#00000000',
-      symbolColor: '#ffffff',
-      height: 40
-    },
+    frame: false,
     show: false,
     backgroundColor: '#000000',
     autoHideMenuBar: true
   })
+
+  setupCustomTitleBarWindow(win)
 
   win.once('ready-to-show', () => {
     win.show()

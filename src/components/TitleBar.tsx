@@ -7,13 +7,17 @@ interface TitleBarProps {
   sidebarCollapsed?: boolean
   onToggleSidebar?: () => void
   showWindowControls?: boolean
+  customControls?: React.ReactNode
+  showLogo?: boolean
 }
 
 function TitleBar({
   title,
   sidebarCollapsed = false,
   onToggleSidebar,
-  showWindowControls = true
+  showWindowControls = true,
+  customControls,
+  showLogo = true
 }: TitleBarProps = {}) {
   const [isMaximized, setIsMaximized] = useState(false)
 
@@ -32,7 +36,7 @@ function TitleBar({
   return (
     <div className="title-bar">
       <div className="title-brand">
-        <img src="./logo.png" alt="WeFlow" className="title-logo" />
+        {showLogo && <img src="./logo.png" alt="WeFlow" className="title-logo" />}
         <span className="titles">{title || 'WeFlow'}</span>
         {onToggleSidebar ? (
           <button
@@ -46,6 +50,7 @@ function TitleBar({
           </button>
         ) : null}
       </div>
+      {customControls}
       {showWindowControls ? (
         <div className="title-window-controls">
           <button

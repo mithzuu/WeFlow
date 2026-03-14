@@ -46,7 +46,6 @@ export function GlobalSessionMonitor() {
             return () => {
                 removeListener()
             }
-        } else {
         }
         return () => { }
     }, [])
