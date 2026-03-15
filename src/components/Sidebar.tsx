@@ -6,6 +6,7 @@ import { useChatStore } from '../stores/chatStore'
 import { useAnalyticsStore } from '../stores/analyticsStore'
 import * as configService from '../services/config'
 import { onExportSessionStatus, requestExportSessionStatus } from '../services/exportBridge'
+import { UserRound } from 'lucide-react'
 
 import './Sidebar.scss'
 
@@ -35,6 +36,7 @@ interface AccountProfilesCache {
 interface WxidOption {
   wxid: string
   modifiedTime: number
+  nickname?: string
   displayName?: string
   avatarUrl?: string
 }
@@ -280,26 +282,28 @@ function Sidebar({ collapsed }: SidebarProps) {
       const accountsCache = readAccountProfilesCache()
       console.log('[切换账号] 账号缓存:', accountsCache)
 
-      const enrichedWxids = wxids.map(option => {
+      const enrichedWxids = wxids.map((option: WxidOption) => {
         const normalizedWxid = normalizeAccountId(option.wxid)
         const cached = accountsCache[option.wxid] || accountsCache[normalizedWxid]
 
+        let displayName = option.nickname || option.wxid
+        let avatarUrl = option.avatarUrl
+
         if (option.wxid === userProfile.wxid || normalizedWxid === userProfile.wxid) {
-          return {
-            ...option,
-            displayName: userProfile.displayName,
-            avatarUrl: userProfile.avatarUrl
-          }
+          displayName = userProfile.displayName || displayName
+          avatarUrl = userProfile.avatarUrl || avatarUrl
         }
-        if (cached) {
-          console.log('[切换账号] 使用缓存:', option.wxid, cached)
-          return {
-            ...option,
-            displayName: cached.displayName,
-            avatarUrl: cached.avatarUrl
-          }
+
+        else if (cached) {
+          displayName = cached.displayName || displayName
+          avatarUrl = cached.avatarUrl || avatarUrl
         }
-        return { ...option, displayName: option.wxid }
+
+        return {
+          ...option,
+          displayName,
+          avatarUrl
+        }
       })
 
       setWxidOptions(enrichedWxids)
@@ -553,11 +557,17 @@ function Sidebar({ collapsed }: SidebarProps) {
                   type="button"
                 >
                   <div className="wxid-avatar">
-                    {option.avatarUrl ? <img src={option.avatarUrl} alt="" /> : <span>{getAvatarLetter(option.displayName || option.wxid)}</span>}
+                    {option.avatarUrl ? (
+                        <img src={option.avatarUrl} alt="" />
+                    ) : (
+                        <div style={{ width: '100%', height: '100%', display: 'flex', alignItems: 'center', justifyContent: 'center', background: 'var(--bg-tertiary)', borderRadius: '6px', color: 'var(--text-tertiary)' }}>
+                          <UserRound size={16} />
+                        </div>
+                    )}
                   </div>
                   <div className="wxid-info">
-                    <div className="wxid-name">{option.displayName || option.wxid}</div>
-                    <div className="wxid-id">{option.wxid}</div>
+                    <div className="wxid-name">{option.displayName}</div>
+                    {option.displayName !== option.wxid && <div className="wxid-id">{option.wxid}</div>}
                   </div>
                   {userProfile.wxid === option.wxid && <span className="current-badge">当前</span>}
                 </button>
