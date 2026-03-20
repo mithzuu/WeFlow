@@ -1923,6 +1923,16 @@ class ExportService {
     }
   }
 
+  private isQuotedReplyMessage(localType: number, content: string): boolean {
+    if (localType === 244813135921) return true
+    const normalized = this.normalizeAppMessageContent(content || '')
+    if (!(localType === 49 || normalized.includes('<appmsg') || normalized.includes('<msg>'))) {
+      return false
+    }
+    const subType = this.extractAppMessageType(normalized)
+    return subType === '57' || normalized.includes('<refermsg>')
+  }
+
   private async resolveQuotedReplyDisplayWithNames(args: {
     content: string
     isGroup: boolean
@@ -6813,7 +6823,7 @@ class ExportService {
         control,
         collectProgressReporter
       )
-      const totalMessages = collected.rows.length
+      let totalMessages = collected.rows.length
       if (totalMessages === 0) {
         return { success: false, error: '该会话在指定时间范围内没有消息' }
       }
@@ -6841,7 +6851,13 @@ class ExportService {
         ? await this.getGroupNicknamesForRoom(sessionId, groupNicknameCandidates)
         : new Map<string, string>()
 
-      const sortedMessages = collected.rows.sort((a, b) => a.createTime - b.createTime)
+      const sortedMessages = collected.rows
+        .sort((a, b) => a.createTime - b.createTime)
+        .filter((msg) => !this.isQuotedReplyMessage(msg.localType, msg.content || ''))
+      totalMessages = sortedMessages.length
+      if (totalMessages === 0) {
+        return { success: false, error: '该会话在指定时间范围内没有可导出的消息' }
+      }
 
       const voiceMessages = options.exportVoiceAsText
         ? sortedMessages.filter(msg => msg.localType === 34)
@@ -6966,7 +6982,7 @@ class ExportService {
       })
 
       const lines: string[] = []
-      lines.push('id,MsgSvrID,ReplyToMsgSvrID,type_name,is_sender,talker,msg,src,CreateTime')
+      lines.push('id,MsgSvrID,type_name,is_sender,talker,msg,src,CreateTime')
       const senderProfileCache = new Map<string, ExportDisplayProfile>()
 
       for (let i = 0; i < totalMessages; i++) {
@@ -7032,31 +7048,16 @@ class ExportService {
             msg.senderUsername,
             msg.isSend
           ) || '')
-        const quotedReplyDisplay = await this.resolveQuotedReplyDisplayWithNames({
-          content: msg.content,
-          isGroup,
-          displayNamePreference: options.displayNamePreference,
-          getContact: getContactCached,
-          groupNicknamesMap,
-          cleanedMyWxid,
-          rawMyWxid,
-          myDisplayName: myInfo.displayName || cleanedMyWxid
-        })
-        const finalMsgText = quotedReplyDisplay
-          ? this.buildQuotedReplyText(quotedReplyDisplay)
-          : msgText
         const src = this.getWeCloneSource(msg, typeName, mediaItem)
         const platformMessageId = this.getExportPlatformMessageId(msg) || ''
-        const replyToMessageId = this.getExportReplyToMessageId(msg.content) || ''
 
         const row = [
           i + 1,
           platformMessageId,
-          replyToMessageId,
           typeName,
           msg.isSend ? 1 : 0,
           talker,
-          finalMsgText,
+          msgText,
           src,
           this.formatIsoTimestamp(msg.createTime)
         ]
