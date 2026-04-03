@@ -7,7 +7,7 @@ export interface BizAccount {
   username: string;
   name: string;
   avatar: string;
-  type: number;
+  type: string;
   last_time: number;
   formatted_last_time: string;
 }
@@ -55,14 +55,23 @@ export const BizAccountList: React.FC<{
     fetch().then(_r => { } );
   }, [myWxid]);
 
+
   const filtered = useMemo(() => {
-    if (!searchKeyword) return accounts;
-    const q = searchKeyword.toLowerCase();
-    return accounts.filter(a =>
-        (a.name && a.name.toLowerCase().includes(q)) ||
-        (a.username && a.username.toLowerCase().includes(q))
-    );
+    let result = accounts;
+    if (searchKeyword) {
+      const q = searchKeyword.toLowerCase();
+      result = accounts.filter(a =>
+          (a.name && a.name.toLowerCase().includes(q)) ||
+          (a.username && a.username.toLowerCase().includes(q))
+      );
+    }
+    return result.sort((a, b) => {
+      if (a.username === 'gh_3dfda90e39d6') return -1; // 微信支付置顶
+      if (b.username === 'gh_3dfda90e39d6') return 1;
+      return b.last_time - a.last_time;
+    });
   }, [accounts, searchKeyword]);
+
 
   if (loading) return <div className="biz-loading">加载中...</div>;
 
@@ -84,18 +93,18 @@ export const BizAccountList: React.FC<{
                   <span className="biz-name">{item.name || item.username}</span>
                   <span className="biz-time">{item.formatted_last_time}</span>
                 </div>
-                {item.username === 'gh_3dfda90e39d6' && (
-                    <div className="biz-badge type-service">服务号</div>
-                )}
+                {/*{item.username === 'gh_3dfda90e39d6' && (*/}
+                {/*    <div className="biz-badge type-service">微信支付</div>*/}
+                {/*)}*/}
 
-                {/* 我看了下没有接口获取相关type，如果exec没法用的话确实无能为力，后面再适配吧 */}
-                {/*<div className={`biz-badge ${*/}
-                {/*    item.type === 1 ? 'type-service' :*/}
-                {/*        item.type === 0 ? 'type-sub' :*/}
-                {/*            item.type === 2 ? 'type-enterprise' : 'type-unknown'*/}
-                {/*}`}>*/}
-                {/*  {item.type === 1 ? '服务号' : item.type === 0 ? '订阅号' : item.type === 2 ? '企业号' : '未知'}*/}
-                {/*</div>*/}
+                <div className={`biz-badge ${
+                    item.type === '1' ? 'type-service' :
+                        item.type === '0' ? 'type-sub' :
+                            item.type === '2' ? 'type-enterprise' : 
+                                item.type === '3' ? 'type-enterprise' : 'type-unknown'
+                }`}>
+                  {item.type === '0' ? '公众号' : item.type === '1' ? '服务号' : item.type === '2' ? '企业号' : item.type === '3' ? '企业附属' :  '未知'}
+                </div>
 
               </div>
             </div>
@@ -104,7 +113,6 @@ export const BizAccountList: React.FC<{
   );
 };
 
-// 2. 公众号消息区域组件
 export const BizMessageArea: React.FC<{
   account: BizAccount | null;
 }> = ({ account }) => {
@@ -115,6 +123,8 @@ export const BizMessageArea: React.FC<{
   const [hasMore, setHasMore] = useState(true);
   const limit = 20;
   const messageListRef = useRef<HTMLDivElement>(null);
+  const lastScrollHeightRef = useRef<number>(0);
+  const isInitialLoadRef = useRef<boolean>(true);
 
   const [myWxid, setMyWxid] = useState<string>('');
 
@@ -143,6 +153,7 @@ export const BizMessageArea: React.FC<{
       setMessages([]);
       setOffset(0);
       setHasMore(true);
+      isInitialLoadRef.current = true;
       loadMessages(account.username, 0);
     }
   }, [account, myWxid]);
@@ -151,6 +162,10 @@ export const BizMessageArea: React.FC<{
     if (loading || !myWxid) return;
 
     setLoading(true);
+    if (messageListRef.current) {
+      lastScrollHeightRef.current = messageListRef.current.scrollHeight;
+    }
+
     try {
       let res;
       if (username === 'gh_3dfda90e39d6') {
@@ -158,9 +173,15 @@ export const BizMessageArea: React.FC<{
       } else {
         res = await window.electronAPI.biz.listMessages(username, myWxid, limit, currentOffset);
       }
+
       if (res) {
         if (res.length < limit) setHasMore(false);
-        setMessages(prev => currentOffset === 0 ? res : [...prev, ...res]);
+
+        setMessages(prev => {
+          const combined = currentOffset === 0 ? res : [...res, ...prev];
+          const uniqueMessages = Array.from(new Map(combined.map(item => [item.local_id || item.create_time, item])).values());
+          return uniqueMessages.sort((a, b) => a.create_time - b.create_time);
+        });
         setOffset(currentOffset + limit);
       }
     } catch (err) {
@@ -170,9 +191,26 @@ export const BizMessageArea: React.FC<{
     }
   };
 
+  useEffect(() => {
+    if (!messageListRef.current) return;
+
+    if (isInitialLoadRef.current && messages.length > 0) {
+      messageListRef.current.scrollTop = messageListRef.current.scrollHeight;
+      isInitialLoadRef.current = false;
+    } else if (messages.length > 0 && !isInitialLoadRef.current && !loading) {
+
+      const newScrollHeight = messageListRef.current.scrollHeight;
+      const heightDiff = newScrollHeight - lastScrollHeightRef.current;
+      if (heightDiff > 0 && messageListRef.current.scrollTop < 100) {
+        messageListRef.current.scrollTop += heightDiff;
+      }
+    }
+  }, [messages, loading]);
+
   const handleScroll = (e: React.UIEvent<HTMLDivElement>) => {
     const target = e.currentTarget;
-    if (target.scrollHeight - Math.abs(target.scrollTop) - target.clientHeight < 50) {
+    // 向上滚动到顶部附近触发加载更多（更旧的消息）
+    if (target.scrollTop < 50) {
       if (!loading && hasMore && account) {
         loadMessages(account.username, offset);
       }
@@ -188,6 +226,30 @@ export const BizMessageArea: React.FC<{
     );
   }
 
+  const formatMessageTime = (timestamp: number) => {
+    if (!timestamp) return '';
+    const date = new Date(timestamp * 1000);
+    const now = new Date();
+    
+    const isToday = date.toDateString() === now.toDateString();
+    if (isToday) {
+      return date.toLocaleTimeString([], { hour: '2-digit', minute: '2-digit', hour12: false });
+    }
+    
+    const yesterday = new Date(now);
+    yesterday.setDate(now.getDate() - 1);
+    if (date.toDateString() === yesterday.toDateString()) {
+      return `昨天 ${date.getHours().toString().padStart(2, '0')}:${date.getMinutes().toString().padStart(2, '0')}`;
+    }
+
+    const isThisYear = date.getFullYear() === now.getFullYear();
+    if (isThisYear) {
+      return `${date.getMonth() + 1}月${date.getDate()}日 ${date.getHours().toString().padStart(2, '0')}:${date.getMinutes().toString().padStart(2, '0')}`;
+    }
+    
+    return `${date.getFullYear()}年${date.getMonth() + 1}月${date.getDate()}日`;
+  };
+
   const defaultImage = 'data:image/svg+xml;base64,PHN2ZyB4bWxucz0iaHR0cDovL3d3dy53My5vcmcvMjAwMC9zdmciIHdpZHRoPSI0MDAiIGhlaWdodD0iMTgwIj48cmVjdCB3aWR0aD0iNDAwIiBoZWlnaHQ9IjE4MCIgZmlsbD0iI2Y1ZjVmNSIvPjwvc3ZnPg==';
 
   return (
@@ -197,6 +259,9 @@ export const BizMessageArea: React.FC<{
         </div>
         <div className="message-container" onScroll={handleScroll} ref={messageListRef}>
           <div className="messages-wrapper">
+            {hasMore && messages.length > 0 && (
+                <div className="biz-loading-more">{loading ? '加载中...' : '向上滚动加载更多历史消息'}</div>
+            )}
             {!loading && messages.length === 0 && (
               <div className="biz-no-record-container">
                 <div className="no-record-icon">
@@ -206,40 +271,50 @@ export const BizMessageArea: React.FC<{
                 <p>该公众号在当前数据库中没有可显示的聊天历史</p>
               </div>
             )}
-            {messages.map((msg) => (
-                <div key={msg.local_id}>
-                  {account.username === 'gh_3dfda90e39d6' ? (
-                      <div className="pay-card">
-                        <div className="pay-header">
-                          {msg.merchant_icon ? <img src={msg.merchant_icon} className="pay-icon" alt=""/> : <div className="pay-icon-placeholder">¥</div>}
-                          <span>{msg.merchant_name || '微信支付'}</span>
-                        </div>
-                        <div className="pay-title">{msg.title}</div>
-                        <div className="pay-desc">{msg.description}</div>
-                        <div className="pay-footer">{msg.formatted_time}</div>
-                      </div>
-                  ) : (
-                      <div className="article-card">
-                        <div onClick={() => window.electronAPI.shell.openExternal(msg.url)} className="main-article">
-                          <img src={msg.cover || defaultImage} className="article-cover" alt=""/>
-                          <div className="article-overlay"><h3 className="article-title">{msg.title}</h3></div>
-                        </div>
-                        {msg.des && <div className="article-digest">{msg.des}</div>}
-                        {msg.content_list && msg.content_list.length > 1 && (
-                            <div className="sub-articles">
-                              {msg.content_list.slice(1).map((item: any, idx: number) => (
-                                  <div key={idx} onClick={() => window.electronAPI.shell.openExternal(item.url)} className="sub-item">
-                                    <span className="sub-title">{item.title}</span>
-                                    {item.cover && <img src={item.cover} className="sub-cover" alt=""/>}
-                                  </div>
-                              ))}
+            {messages.map((msg, index) => {
+                const showTime = true;
+                
+                return (
+                    <div key={msg.local_id || index}>
+                      {showTime && (
+                          <div className="time-divider">
+                            <span>{formatMessageTime(msg.create_time)}</span>
+                          </div>
+                      )}
+                      
+                      {account.username === 'gh_3dfda90e39d6' ? (
+                          <div className="pay-card">
+                            <div className="pay-header">
+                              {msg.merchant_icon ? <img src={msg.merchant_icon} className="pay-icon" alt=""/> : <div className="pay-icon-placeholder">¥</div>}
+                              <span>{msg.merchant_name || '微信支付'}</span>
                             </div>
-                        )}
-                      </div>
-                  )}
-                </div>
-            ))}
-            {loading && <div className="biz-loading-more">加载中...</div>}
+                            <div className="pay-title">{msg.title}</div>
+                            <div className="pay-desc">{msg.description}</div>
+                            {/* <div className="pay-footer">{msg.formatted_time}</div> */}
+                          </div>
+                      ) : (
+                          <div className="article-card">
+                            <div onClick={() => window.electronAPI.shell.openExternal(msg.url)} className="main-article">
+                              <img src={msg.cover || defaultImage} className="article-cover" alt=""/>
+                              <div className="article-overlay"><h3 className="article-title">{msg.title}</h3></div>
+                            </div>
+                            {msg.des && <div className="article-digest">{msg.des}</div>}
+                            {msg.content_list && msg.content_list.length > 1 && (
+                                <div className="sub-articles">
+                                  {msg.content_list.slice(1).map((item: any, idx: number) => (
+                                      <div key={idx} onClick={() => window.electronAPI.shell.openExternal(item.url)} className="sub-item">
+                                        <span className="sub-title">{item.title}</span>
+                                        {item.cover && <img src={item.cover} className="sub-cover" alt=""/>}
+                                      </div>
+                                  ))}
+                                </div>
+                            )}
+                          </div>
+                      )}
+                    </div>
+                );
+            })}
+            {loading && offset === 0 && <div className="biz-loading-more">加载中...</div>}
           </div>
         </div>
       </div>
