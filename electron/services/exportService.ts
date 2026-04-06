@@ -254,6 +254,7 @@ async function parallelLimit<T, R>(
 
 class ExportService {
   private configService: ConfigService
+  private runtimeConfig: { dbPath?: string; decryptKey?: string; myWxid?: string } | null = null
   private contactCache: LRUCache<string, { displayName: string; avatarUrl?: string }>
   private inlineEmojiCache: LRUCache<string, string>
   private htmlStyleCache: string | null = null
@@ -293,6 +294,10 @@ class ExportService {
     const error = new Error('导出任务已停止')
     ;(error as Error & { code?: string }).code = this.STOP_ERROR_CODE
     return error
+  }
+
+  setRuntimeConfig(config: { dbPath?: string; decryptKey?: string; myWxid?: string } | null): void {
+    this.runtimeConfig = config
   }
 
   private normalizeSessionIds(sessionIds: string[]): string[] {
@@ -1316,9 +1321,9 @@ class ExportService {
   }
 
   private async ensureConnected(): Promise<{ success: boolean; cleanedWxid?: string; error?: string }> {
-    const wxid = this.configService.get('myWxid')
-    const dbPath = this.configService.get('dbPath')
-    const decryptKey = this.configService.get('decryptKey')
+    const wxid = String(this.runtimeConfig?.myWxid || this.configService.get('myWxid') || '').trim()
+    const dbPath = String(this.runtimeConfig?.dbPath || this.configService.get('dbPath') || '').trim()
+    const decryptKey = String(this.runtimeConfig?.decryptKey || this.configService.get('decryptKey') || '').trim()
     if (!wxid) return { success: false, error: '请先在设置页面配置微信ID' }
     if (!dbPath) return { success: false, error: '请先在设置页面配置数据库路径' }
     if (!decryptKey) return { success: false, error: '请先在设置页面配置解密密钥' }
