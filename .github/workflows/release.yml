@@ -36,7 +36,7 @@ jobs:
         run: |
           VERSION=${GITHUB_REF_NAME#v}
           echo "Syncing package.json version to $VERSION"
-          npm version $VERSION --no-git-tag-version --allow-same-version
+          node -e "const fs=require('fs');const p=JSON.parse(fs.readFileSync('package.json','utf8'));p.version='$VERSION';fs.writeFileSync('package.json',JSON.stringify(p,null,2)+'\n')"
 
       - name: Build Frontend & Type Check
         shell: bash
@@ -93,7 +93,7 @@ jobs:
         run: |
           VERSION=${GITHUB_REF_NAME#v}
           echo "Syncing package.json version to $VERSION"
-          npm version $VERSION --no-git-tag-version --allow-same-version
+          node -e "const fs=require('fs');const p=JSON.parse(fs.readFileSync('package.json','utf8'));p.version='$VERSION';fs.writeFileSync('package.json',JSON.stringify(p,null,2)+'\n')"
 
       - name: Build Frontend & Type Check
         shell: bash
@@ -144,7 +144,7 @@ jobs:
         run: |
           VERSION=${GITHUB_REF_NAME#v}
           echo "Syncing package.json version to $VERSION"
-          npm version $VERSION --no-git-tag-version --allow-same-version
+          node -e "const fs=require('fs');const p=JSON.parse(fs.readFileSync('package.json','utf8'));p.version='$VERSION';fs.writeFileSync('package.json',JSON.stringify(p,null,2)+'\n')"
 
       - name: Build Frontend & Type Check
         shell: bash
@@ -195,7 +195,7 @@ jobs:
         run: |
           VERSION=${GITHUB_REF_NAME#v}
           echo "Syncing package.json version to $VERSION"
-          npm version $VERSION --no-git-tag-version --allow-same-version
+          node -e "const fs=require('fs');const p=JSON.parse(fs.readFileSync('package.json','utf8'));p.version='$VERSION';fs.writeFileSync('package.json',JSON.stringify(p,null,2)+'\n')"
 
       - name: Build Frontend & Type Check
         shell: bash
