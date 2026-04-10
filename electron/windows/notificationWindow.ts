@@ -115,12 +115,12 @@ export async function showNotification(data: any) {
   // 检查会话过滤
   const filterMode = config.get("notificationFilterMode") || "all";
   const filterList = config.get("notificationFilterList") || [];
-  const sessionId = data.sessionId;
+  const sessionId = typeof data.sessionId === "string" ? data.sessionId : "";
 
-  if (sessionId && filterMode !== "all" && filterList.length > 0) {
-    const isInList = filterList.includes(sessionId);
+  if (filterMode !== "all") {
+    const isInList = sessionId !== "" && filterList.includes(sessionId);
     if (filterMode === "whitelist" && !isInList) {
-      // 白名单模式：不在列表中则不显示
+      // 白名单模式：不在列表中则不显示（空列表视为全部拦截）
       return;
     }
     if (filterMode === "blacklist" && isInList) {
