@@ -311,10 +311,22 @@ jobs:
           with:
             fetch-depth: 0
 
+        - name: Update PKGBUILD version
+          run: |
+            NEW_VER=$(echo "${{ github.ref_name }}" | sed 's/^v//')
+            sed -i "s/^pkgver=.*/pkgver=${NEW_VER}/" resources/installer/linux/PKGBUILD
+            sed -i "s/^pkgrel=.*/pkgrel=1/" resources/installer/linux/PKGBUILD
+
         - name: Publish AUR package
           uses: KSXGitHub/github-actions-deploy-aur@master
           with:
             pkgname: weflow
+            pkgbuild: resources/installer/linux/PKGBUILD
+            updpkgsums: true
+            assets: |
+              resources/installer/linux/weflow.desktop
+              resources/installer/linux/icon.png
+
             ssh_private_key: ${{ secrets.AUR_SSH_PRIVATE_KEY }}
             commit_username: H3CoF6
             commit_email: h3cof6@gmail.com
