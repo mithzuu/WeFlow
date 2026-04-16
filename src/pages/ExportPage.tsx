@@ -32,6 +32,12 @@ import {
 import type { ChatSession as AppChatSession, ContactInfo } from '../types/models'
 import type { ExportOptions as ElectronExportOptions, ExportProgress } from '../types/electron'
 import type { BackgroundTaskRecord } from '../types/backgroundTask'
+import type {
+  ExportAutomationCondition,
+  ExportAutomationDateRangeConfig,
+  ExportAutomationSchedule,
+  ExportAutomationTask
+} from '../types/exportAutomation'
 import * as configService from '../services/config'
 import {
   emitExportSessionStatus,
@@ -55,12 +61,15 @@ import type { SnsPost } from '../types/sns'
 import {
   cloneExportDateRange,
   cloneExportDateRangeSelection,
+  createDateRangeByLastNDays,
   createDefaultDateRange,
   createDefaultExportDateRangeSelection,
   getExportDateRangeLabel,
   resolveExportDateRangeConfig,
+  serializeExportDateRangeConfig,
   startOfDay,
   endOfDay,
+  type ExportDateRangePreset,
   type ExportDateRangeSelection
 } from '../utils/exportDateRange'
 import './ExportPage.scss'
@@ -147,6 +156,8 @@ interface ExportTaskPayload {
   outputDir: string
   options?: ElectronExportOptions
   scope: TaskScope
+  source: 'manual' | 'automation'
+  automationTaskId?: string
   contentType?: ContentType
   sessionNames: string[]
   snsOptions?: {
@@ -175,11 +186,33 @@ interface ExportTask {
 
 interface ExportDialogState {
   open: boolean
+  intent: 'manual' | 'automation-create'
   scope: TaskScope
   contentType?: ContentType
   sessionIds: string[]
   sessionNames: string[]
   title: string
+}
+
+interface AutomationTaskDraft {
+  mode: 'create' | 'edit'
+  id?: string
+  name: string
+  enabled: boolean
+  sessionIds: string[]
+  sessionNames: string[]
+  outputDir: string
+  useGlobalOutputDir: boolean
+  scope: Exclude<TaskScope, 'sns'>
+  contentType?: ContentType
+  optionTemplate: Omit<ElectronExportOptions, 'dateRange'>
+  dateRangeConfig: ExportAutomationDateRangeConfig | string | null
+  intervalDays: number
+  intervalHours: number
+  stopAtEnabled: boolean
+  stopAtValue: string
+  maxRunsEnabled: boolean
+  maxRuns: number
 }
 
 const defaultTxtColumns = ['index', 'time', 'senderRole', 'messageType', 'content']
@@ -589,6 +622,7 @@ const matchesContactTab = (contact: ContactInfo, tab: ConversationTab): boolean 
 }
 
 const createTaskId = (): string => `task-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`
+const createAutomationTaskId = (): string => `auto-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`
 const CONTACT_ENRICH_TIMEOUT_MS = 7000
 const EXPORT_SNS_STATS_CACHE_STALE_MS = 12 * 60 * 60 * 1000
 const EXPORT_AVATAR_ENRICH_BATCH_SIZE = 80
@@ -598,6 +632,220 @@ const EXPORT_REENTER_CONTACTS_SOFT_REFRESH_MS = 5 * 60 * 1000
 const EXPORT_REENTER_SNS_SOFT_REFRESH_MS = 3 * 60 * 1000
 type SessionDataSource = 'cache' | 'network' | null
 type ContactsDataSource = 'cache' | 'network' | null
+
+const normalizeAutomationIntervalDays = (value: unknown): number => Math.max(0, Math.floor(Number(value) || 0))
+const normalizeAutomationIntervalHours = (value: unknown): number => Math.max(0, Math.min(23, Math.floor(Number(value) || 0)))
+
+const resolveAutomationIntervalMs = (schedule: ExportAutomationSchedule): number => {
+  const days = normalizeAutomationIntervalDays(schedule.intervalDays)
+  const hours = normalizeAutomationIntervalHours(schedule.intervalHours)
+  const totalHours = (days * 24) + hours
+  if (totalHours <= 0) return 0
+  return totalHours * 60 * 60 * 1000
+}
+
+const formatAutomationScheduleLabel = (schedule: ExportAutomationSchedule): string => {
+  const days = normalizeAutomationIntervalDays(schedule.intervalDays)
+  const hours = normalizeAutomationIntervalHours(schedule.intervalHours)
+  const parts: string[] = []
+  if (days > 0) parts.push(`${days} 天`)
+  if (hours > 0) parts.push(`${hours} 小时`)
+  return `每间隔 ${parts.length > 0 ? parts.join(' ') : '0 小时'} 执行一次`
+}
+
+const resolveAutomationDueScheduleKey = (task: ExportAutomationTask, now: Date): string | null => {
+  const intervalMs = resolveAutomationIntervalMs(task.schedule)
+  if (intervalMs <= 0) return null
+  const nowMs = now.getTime()
+  const anchorAt = Math.max(
+    0,
+    Number(task.runState?.lastTriggeredAt || 0) || Number(task.createdAt || 0)
+  )
+  if (nowMs < anchorAt + intervalMs) return null
+  return `interval:${anchorAt}:${Math.floor((nowMs - anchorAt) / intervalMs)}`
+}
+
+const toDateTimeLocalValue = (timestamp: number): string => {
+  const date = new Date(timestamp)
+  if (Number.isNaN(date.getTime())) return ''
+  const year = date.getFullYear()
+  const month = `${date.getMonth() + 1}`.padStart(2, '0')
+  const day = `${date.getDate()}`.padStart(2, '0')
+  const hours = `${date.getHours()}`.padStart(2, '0')
+  const minutes = `${date.getMinutes()}`.padStart(2, '0')
+  return `${year}-${month}-${day}T${hours}:${minutes}`
+}
+
+const parseDateTimeLocalValue = (value: string): number | null => {
+  const text = String(value || '').trim()
+  if (!text) return null
+  const parsed = new Date(text)
+  const timestamp = parsed.getTime()
+  if (!Number.isFinite(timestamp)) return null
+  return Math.floor(timestamp)
+}
+
+type AutomationRangeMode = 'all' | 'today' | 'yesterday' | 'last7days' | 'last30days' | 'last1year' | 'lastNDays' | 'custom'
+
+const AUTOMATION_RANGE_OPTIONS: Array<{ mode: AutomationRangeMode; label: string }> = [
+  { mode: 'all', label: '全部时间' },
+  { mode: 'yesterday', label: '往前1天' },
+  { mode: 'last7days', label: '往前7天' },
+  { mode: 'last30days', label: '往前30天' },
+  { mode: 'last1year', label: '往前1年' },
+  { mode: 'lastNDays', label: '往前N天' },
+  { mode: 'custom', label: '完整时间' }
+]
+
+const AUTOMATION_LAST_N_DAYS_MIN = 1
+const AUTOMATION_LAST_N_DAYS_MAX = 3650
+const AUTOMATION_LAST_N_DAYS_DEFAULT = 3
+
+const normalizeAutomationLastNDays = (value: unknown): number => {
+  const parsed = Math.floor(Number(value) || 0)
+  if (!Number.isFinite(parsed) || parsed <= 0) return AUTOMATION_LAST_N_DAYS_DEFAULT
+  return Math.min(AUTOMATION_LAST_N_DAYS_MAX, Math.max(AUTOMATION_LAST_N_DAYS_MIN, parsed))
+}
+
+const readAutomationLastNDays = (
+  config: ExportAutomationDateRangeConfig | string | null | undefined
+): number | null => {
+  if (!config || typeof config !== 'object') return null
+  const raw = config as Record<string, unknown>
+  const mode = String(raw.relativeMode || '').trim()
+  if (mode !== 'last-n-days') return null
+  const days = Math.floor(Number(raw.relativeDays) || 0)
+  if (!Number.isFinite(days) || days <= 0) return null
+  return Math.min(AUTOMATION_LAST_N_DAYS_MAX, Math.max(AUTOMATION_LAST_N_DAYS_MIN, days))
+}
+
+const buildAutomationLastNDaysConfig = (days: number): ExportAutomationDateRangeConfig => ({
+  version: 1,
+  preset: 'custom',
+  useAllTime: false,
+  relativeMode: 'last-n-days',
+  relativeDays: normalizeAutomationLastNDays(days)
+})
+
+const resolveAutomationDateRangeSelection = (
+  config: ExportAutomationDateRangeConfig | string | null | undefined,
+  now = new Date()
+): ExportDateRangeSelection => {
+  const relativeDays = readAutomationLastNDays(config)
+  if (relativeDays) {
+    return {
+      preset: 'custom',
+      useAllTime: false,
+      dateRange: createDateRangeByLastNDays(relativeDays, now)
+    }
+  }
+  return resolveExportDateRangeConfig(config as any, now)
+}
+
+const resolveAutomationRangeMode = (
+  config: ExportAutomationDateRangeConfig | string | null | undefined,
+  selection: ExportDateRangeSelection
+): AutomationRangeMode => {
+  if (readAutomationLastNDays(config)) return 'lastNDays'
+  if (selection.useAllTime) return 'all'
+  if (selection.preset === 'today') return 'today'
+  if (selection.preset === 'yesterday') return 'yesterday'
+  if (selection.preset === 'last7days') return 'last7days'
+  if (selection.preset === 'last30days') return 'last30days'
+  if (selection.preset === 'last1year') return 'last1year'
+  return 'custom'
+}
+
+const createAutomationSelectionByMode = (
+  mode: Exclude<AutomationRangeMode, 'custom' | 'lastNDays'>,
+  now = new Date()
+): ExportDateRangeSelection => {
+  const preset: ExportDateRangePreset = mode
+  return resolveExportDateRangeConfig({
+    version: 1,
+    preset,
+    useAllTime: mode === 'all'
+  }, now)
+}
+
+const formatAutomationRangeLabel = (
+  config: ExportAutomationDateRangeConfig | string | null | undefined,
+  selection?: ExportDateRangeSelection
+): string => {
+  const resolved = selection || resolveAutomationDateRangeSelection(config, new Date())
+  const mode = resolveAutomationRangeMode(config, resolved)
+  if (mode === 'all') return '每次触发导出全部历史消息'
+  if (mode === 'today') return '每次触发导出当天'
+  if (mode === 'yesterday') return '每次触发导出前1天（昨日）'
+  if (mode === 'last7days') return '每次触发导出前7天'
+  if (mode === 'last30days') return '每次触发导出前30天'
+  if (mode === 'last1year') return '每次触发导出前1年'
+  if (mode === 'lastNDays') {
+    return `每次触发导出前 ${readAutomationLastNDays(config) || AUTOMATION_LAST_N_DAYS_DEFAULT} 天`
+  }
+  return `完整时间：${getExportDateRangeLabel(resolved)}`
+}
+
+const formatAutomationStopCondition = (task: ExportAutomationTask): string => {
+  const endAt = Number(task.stopCondition?.endAt || 0)
+  const maxRuns = Number(task.stopCondition?.maxRuns || 0)
+  const labels: string[] = []
+  if (endAt > 0) {
+    labels.push(`截止到 ${new Date(endAt).toLocaleString('zh-CN')}`)
+  }
+  if (maxRuns > 0) {
+    const successCount = Math.max(0, Math.floor(Number(task.runState?.successCount || 0)))
+    labels.push(`成功 ${successCount}/${maxRuns} 次后停止`)
+  }
+  return labels.length > 0 ? labels.join(' · ') : '无'
+}
+
+const resolveAutomationNextTriggerAt = (task: ExportAutomationTask): number | null => {
+  const intervalMs = resolveAutomationIntervalMs(task.schedule)
+  if (intervalMs <= 0) return null
+  const anchorAt = Math.max(0, Number(task.runState?.lastTriggeredAt || 0) || Number(task.createdAt || 0))
+  if (!anchorAt) return null
+  return anchorAt + intervalMs
+}
+
+const formatAutomationCurrentState = (
+  task: ExportAutomationTask,
+  queueState: 'queued' | 'running' | null,
+  nowMs: number
+): string => {
+  if (!task.enabled) return '已停用'
+  if (queueState === 'running') return '执行中'
+  if (queueState === 'queued') return '排队中'
+  const nextTriggerAt = resolveAutomationNextTriggerAt(task)
+  if (!nextTriggerAt) return '等待触发'
+  const diff = nextTriggerAt - nowMs
+  if (diff <= 0) return '即将触发'
+  return `等待触发 · 下次 ${new Date(nextTriggerAt).toLocaleString('zh-CN')}（约 ${formatDurationMs(diff)} 后）`
+}
+
+const formatAutomationLastRunSummary = (task: ExportAutomationTask): string => {
+  const status = task.runState?.lastRunStatus || 'idle'
+  const label = (
+    status === 'idle' ? '尚未执行' :
+    status === 'queued' ? '已入队' :
+    status === 'running' ? '执行中' :
+    status === 'success' ? '执行成功' :
+    status === 'error' ? '执行失败' :
+    status === 'skipped' ? '已跳过' :
+    status
+  )
+  const parts: string[] = [label]
+  if (task.runState?.lastSuccessAt) {
+    parts.push(`最近成功于 ${new Date(task.runState.lastSuccessAt).toLocaleString('zh-CN')}`)
+  }
+  if (task.runState?.lastSkipReason) {
+    parts.push(task.runState.lastSkipReason)
+  }
+  if (task.runState?.lastError) {
+    parts.push(task.runState.lastError)
+  }
+  return parts.join(' · ')
+}
 
 interface ContactsLoadSession {
   requestId: string
@@ -1105,21 +1353,42 @@ const clampExportSelectionToBounds = (
 ): ExportDateRangeSelection => {
   if (!bounds) return cloneExportDateRangeSelection(selection)
 
-  const boundedStart = startOfDay(bounds.minDate)
-  const boundedEnd = endOfDay(bounds.maxDate)
-  const originalStart = selection.useAllTime ? boundedStart : startOfDay(selection.dateRange.start)
-  const originalEnd = selection.useAllTime ? boundedEnd : endOfDay(selection.dateRange.end)
-  const nextStart = new Date(Math.min(Math.max(originalStart.getTime(), boundedStart.getTime()), boundedEnd.getTime()))
-  const nextEndCandidate = new Date(Math.min(Math.max(originalEnd.getTime(), boundedStart.getTime()), boundedEnd.getTime()))
-  const nextEnd = nextEndCandidate.getTime() < nextStart.getTime() ? endOfDay(nextStart) : nextEndCandidate
-  const rangeChanged = nextStart.getTime() !== originalStart.getTime() || nextEnd.getTime() !== originalEnd.getTime()
+  // For custom selections, only ensure end >= start, preserve time precision
+  if (selection.preset === 'custom' && !selection.useAllTime) {
+    const { start, end } = selection.dateRange
+    if (end.getTime() < start.getTime()) {
+      return {
+        ...selection,
+        dateRange: { start, end: start }
+      }
+    }
+    return cloneExportDateRangeSelection(selection)
+  }
 
+  // For useAllTime, use bounds directly
+  if (selection.useAllTime) {
+    return {
+      preset: selection.preset,
+      useAllTime: true,
+      dateRange: {
+        start: bounds.minDate,
+        end: bounds.maxDate
+      }
+    }
+  }
+
+  // For preset selections (not custom), clamp dates to bounds and use default times
+  const boundedStart = new Date(Math.min(Math.max(selection.dateRange.start.getTime(), bounds.minDate.getTime()), bounds.maxDate.getTime()))
+  const boundedEnd = new Date(Math.min(Math.max(selection.dateRange.end.getTime(), bounds.minDate.getTime()), bounds.maxDate.getTime()))
+  // Use default times: start at 00:00, end at 23:59:59
+  boundedStart.setHours(0, 0, 0, 0)
+  boundedEnd.setHours(23, 59, 59, 999)
   return {
-    preset: selection.useAllTime ? selection.preset : (rangeChanged ? 'custom' : selection.preset),
-    useAllTime: selection.useAllTime,
+    preset: selection.preset,
+    useAllTime: false,
     dateRange: {
-      start: nextStart,
-      end: nextEnd
+      start: boundedStart,
+      end: boundedEnd
     }
   }
 }
@@ -1553,6 +1822,8 @@ function ExportPage() {
   const [isSnsStatsLoading, setIsSnsStatsLoading] = useState(true)
   const [isBaseConfigLoading, setIsBaseConfigLoading] = useState(true)
   const [isTaskCenterOpen, setIsTaskCenterOpen] = useState(false)
+  const [isAutomationModalOpen, setIsAutomationModalOpen] = useState(false)
+  const [automationHint, setAutomationHint] = useState<string | null>(null)
   const [expandedPerfTaskId, setExpandedPerfTaskId] = useState<string | null>(null)
   const [sessions, setSessions] = useState<SessionRow[]>([])
   const [sessionDataSource, setSessionDataSource] = useState<SessionDataSource>(null)
@@ -1621,6 +1892,7 @@ function ExportPage() {
   const [exportDefaultFormat, setExportDefaultFormat] = useState<TextExportFormat>('excel')
   const [exportDefaultAvatars, setExportDefaultAvatars] = useState(true)
   const [exportDefaultDateRangeSelection, setExportDefaultDateRangeSelection] = useState<ExportDateRangeSelection>(() => createDefaultExportDateRangeSelection())
+  const [exportDefaultFileNamingMode, setExportDefaultFileNamingMode] = useState<configService.ExportFileNamingMode>('classic')
   const [exportDefaultMedia, setExportDefaultMedia] = useState<configService.ExportDefaultMediaConfig>({
     images: true,
     videos: true,
@@ -1658,14 +1930,22 @@ function ExportPage() {
 
   const [exportDialog, setExportDialog] = useState<ExportDialogState>({
     open: false,
+    intent: 'manual',
     scope: 'single',
     sessionIds: [],
     sessionNames: [],
     title: ''
   })
+  const [isAutomationCreateMode, setIsAutomationCreateMode] = useState(false)
   const [showSessionFormatSelect, setShowSessionFormatSelect] = useState(false)
 
   const [tasks, setTasks] = useState<ExportTask[]>([])
+  const [automationTasks, setAutomationTasks] = useState<ExportAutomationTask[]>([])
+  const [automationTaskDraft, setAutomationTaskDraft] = useState<AutomationTaskDraft | null>(null)
+  const [isAutomationRangeDialogOpen, setIsAutomationRangeDialogOpen] = useState(false)
+  const [isResolvingAutomationRangeBounds, setIsResolvingAutomationRangeBounds] = useState(false)
+  const [automationRangeBounds, setAutomationRangeBounds] = useState<TimeRangeBounds | null>(null)
+  const [automationRangeSelection, setAutomationRangeSelection] = useState<ExportDateRangeSelection>(() => createDefaultExportDateRangeSelection())
   const [lastExportBySession, setLastExportBySession] = useState<Record<string, number>>({})
   const [lastExportByContent, setLastExportByContent] = useState<Record<string, number>>({})
   const [exportRecordsBySession, setExportRecordsBySession] = useState<Record<string, configService.ExportSessionRecordEntry[]>>({})
@@ -1692,6 +1972,10 @@ function ExportPage() {
   const progressUnsubscribeRef = useRef<(() => void) | null>(null)
   const runningTaskIdRef = useRef<string | null>(null)
   const tasksRef = useRef<ExportTask[]>([])
+  const automationTasksRef = useRef<ExportAutomationTask[]>([])
+  const automationTasksReadyRef = useRef(false)
+  const automationSchedulerRunningRef = useRef(false)
+  const automationQueueStatusByTaskIdRef = useRef<Map<string, TaskStatus>>(new Map())
   const hasSeededSnsStatsRef = useRef(false)
   const sessionLoadTokenRef = useRef(0)
   const preselectAppliedRef = useRef(false)
@@ -1788,6 +2072,46 @@ function ExportPage() {
     return scopeKey
   }, [])
 
+  const persistAutomationTasks = useCallback(async (nextTasks: ExportAutomationTask[]) => {
+    if (!automationTasksReadyRef.current) return
+    const scopeKey = await ensureExportCacheScope()
+    await configService.setExportAutomationTasks(scopeKey, nextTasks)
+  }, [ensureExportCacheScope])
+
+  const updateAutomationTasks = useCallback((
+    updater: (prev: ExportAutomationTask[]) => ExportAutomationTask[]
+  ) => {
+    setAutomationTasks((prev) => {
+      const next = updater(prev)
+      void persistAutomationTasks(next)
+      return next
+    })
+  }, [persistAutomationTasks])
+
+  const patchAutomationTask = useCallback((
+    taskId: string,
+    updater: (task: ExportAutomationTask) => ExportAutomationTask
+  ) => {
+    updateAutomationTasks((prev) => prev.map((task) => (task.id === taskId ? updater(task) : task)))
+  }, [updateAutomationTasks])
+
+  const markAutomationTaskSkipped = useCallback((taskId: string, reason: string, scheduleKey?: string) => {
+    const now = Date.now()
+    patchAutomationTask(taskId, (task) => ({
+      ...task,
+      updatedAt: now,
+      runState: {
+        ...(task.runState || {}),
+        lastRunStatus: 'skipped',
+        lastTriggeredAt: now,
+        lastSkipAt: now,
+        lastSkipReason: reason,
+        lastError: undefined,
+        lastScheduleKey: scheduleKey || task.runState?.lastScheduleKey
+      }
+    }))
+  }, [patchAutomationTask])
+
   const loadContactsCaches = useCallback(async (scopeKey: string) => {
     const [contactsItem, avatarItem] = await Promise.all([
       configService.getContactsListCache(scopeKey),
@@ -1798,6 +2122,22 @@ function ExportPage() {
       avatarItem
     }
   }, [])
+
+  const ensureAutomationTasksLoaded = useCallback(async () => {
+    if (automationTasksReadyRef.current) return
+    try {
+      const scopeKey = await ensureExportCacheScope()
+      const automationTaskItem = await configService.getExportAutomationTasks(scopeKey)
+      setAutomationTasks(automationTaskItem?.tasks || [])
+      automationTasksReadyRef.current = true
+    } catch (error) {
+      console.error('加载自动化导出任务失败:', error)
+    }
+  }, [ensureExportCacheScope])
+
+  useEffect(() => {
+    void ensureAutomationTasksLoaded()
+  }, [ensureAutomationTasksLoaded])
 
   useEffect(() => {
     let cancelled = false
@@ -2213,6 +2553,10 @@ function ExportPage() {
   }, [tasks])
 
   useEffect(() => {
+    automationTasksRef.current = automationTasks
+  }, [automationTasks])
+
+  useEffect(() => {
     sessionsRef.current = sessions
   }, [sessions])
 
@@ -2266,11 +2610,19 @@ function ExportPage() {
     return () => window.clearInterval(timer)
   }, [isTaskCenterOpen, expandedPerfTaskId, tasks])
 
+  useEffect(() => {
+    if (!isAutomationModalOpen) return
+    setNowTick(Date.now())
+    const timer = window.setInterval(() => setNowTick(Date.now()), 1000)
+    return () => window.clearInterval(timer)
+  }, [isAutomationModalOpen])
+
   const loadBaseConfig = useCallback(async (): Promise<boolean> => {
     setIsBaseConfigLoading(true)
+    automationTasksReadyRef.current = false
     let isReady = true
     try {
-      const [savedPath, savedFormat, savedAvatars, savedMedia, savedVoiceAsText, savedExcelCompactColumns, savedTxtColumns, savedConcurrency, savedImageDeepSearchOnMiss, savedSessionMap, savedContentMap, savedSessionRecordMap, savedSnsPostCount, savedWriteLayout, savedSessionNameWithTypePrefix, savedDefaultDateRange, exportCacheScope] = await Promise.all([
+      const [savedPath, savedFormat, savedAvatars, savedMedia, savedVoiceAsText, savedExcelCompactColumns, savedTxtColumns, savedConcurrency, savedImageDeepSearchOnMiss, savedSessionMap, savedContentMap, savedSessionRecordMap, savedSnsPostCount, savedWriteLayout, savedSessionNameWithTypePrefix, savedDefaultDateRange, savedFileNamingMode, exportCacheScope] = await Promise.all([
         configService.getExportPath(),
         configService.getExportDefaultFormat(),
         configService.getExportDefaultAvatars(),
@@ -2287,10 +2639,12 @@ function ExportPage() {
         configService.getExportWriteLayout(),
         configService.getExportSessionNamePrefixEnabled(),
         configService.getExportDefaultDateRange(),
+        configService.getExportDefaultFileNamingMode(),
         ensureExportCacheScope()
       ])
 
       const cachedSnsStats = await configService.getExportSnsStatsCache(exportCacheScope)
+      const automationTaskItem = await configService.getExportAutomationTasks(exportCacheScope)
 
       if (savedPath) {
         setExportFolder(savedPath)
@@ -2318,6 +2672,9 @@ function ExportPage() {
       setExportDefaultExcelCompactColumns(savedExcelCompactColumns ?? true)
       setExportDefaultConcurrency(savedConcurrency ?? 2)
       setExportDefaultImageDeepSearchOnMiss(savedImageDeepSearchOnMiss ?? true)
+      setExportDefaultFileNamingMode(savedFileNamingMode ?? 'classic')
+      setAutomationTasks(automationTaskItem?.tasks || [])
+      automationTasksReadyRef.current = true
       const resolvedDefaultDateRange = resolveExportDateRangeConfig(savedDefaultDateRange)
       setExportDefaultDateRangeSelection(resolvedDefaultDateRange)
       setTimeRangeSelection(resolvedDefaultDateRange)
@@ -2357,6 +2714,7 @@ function ExportPage() {
       }))
     } catch (error) {
       isReady = false
+      automationTasksReadyRef.current = false
       console.error('加载导出配置失败:', error)
     } finally {
       setIsBaseConfigLoading(false)
@@ -4022,6 +4380,7 @@ function ExportPage() {
   useEffect(() => {
     if (isExportRoute) return
     // 导出页隐藏时停止后台联系人补齐请求，避免与通讯录页面查询抢占。
+    setIsAutomationCreateMode(false)
     sessionLoadTokenRef.current = Date.now()
     sessionCountRequestIdRef.current += 1
     snsUserPostCountsHydrationTokenRef.current += 1
@@ -4102,8 +4461,8 @@ function ExportPage() {
 
   const clearSelection = () => setSelectedSessions(new Set())
 
-  const openExportDialog = useCallback((payload: Omit<ExportDialogState, 'open'>) => {
-    setExportDialog({ open: true, ...payload })
+  const openExportDialog = useCallback((payload: Omit<ExportDialogState, 'open' | 'intent'> & { intent?: ExportDialogState['intent'] }) => {
+    setExportDialog({ open: true, intent: payload.intent || 'manual', ...payload })
     setIsTimeRangeDialogOpen(false)
     setTimeRangeBounds(null)
     setTimeRangeSelection(exportDefaultDateRangeSelection)
@@ -4173,7 +4532,7 @@ function ExportPage() {
   ])
 
   const closeExportDialog = useCallback(() => {
-    setExportDialog(prev => ({ ...prev, open: false }))
+    setExportDialog(prev => ({ ...prev, open: false, intent: 'manual' }))
     setIsTimeRangeDialogOpen(false)
     setTimeRangeBounds(null)
   }, [])
@@ -4397,6 +4756,7 @@ function ExportPage() {
       displayNamePreference: options.displayNamePreference,
       exportConcurrency: options.exportConcurrency,
       imageDeepSearchOnMiss: options.imageDeepSearchOnMiss,
+      fileNamingMode: exportDefaultFileNamingMode,
       sessionLayout,
       sessionNameWithTypePrefix,
       dateRange: options.useAllTime
@@ -4462,6 +4822,202 @@ function ExportPage() {
       endTime: dateRange?.endTime
     }
   }
+
+  const openCreateAutomationDraft = useCallback(() => {
+    setIsAutomationModalOpen(false)
+    setAutomationTaskDraft(null)
+    setIsAutomationRangeDialogOpen(false)
+    setIsAutomationCreateMode(true)
+    setSelectedSessions(new Set())
+    setAutomationHint('已进入自动化任务创建：请勾选联系人，然后点击「加入任务」')
+  }, [])
+
+  const openEditAutomationTaskDraft = useCallback((task: ExportAutomationTask) => {
+    const schedule = task.schedule
+    const stopAt = Number(task.stopCondition?.endAt || 0)
+    const maxRuns = Number(task.stopCondition?.maxRuns || 0)
+    const resolvedRange = resolveAutomationDateRangeSelection(task.template.dateRangeConfig as any, new Date())
+    setAutomationRangeSelection(resolvedRange)
+    setAutomationRangeBounds(null)
+    setAutomationTaskDraft({
+      mode: 'edit',
+      id: task.id,
+      name: task.name,
+      enabled: task.enabled,
+      sessionIds: task.sessionIds,
+      sessionNames: task.sessionNames,
+      outputDir: task.outputDir || exportFolder,
+      useGlobalOutputDir: !task.outputDir,
+      scope: task.template.scope,
+      contentType: task.template.contentType,
+      optionTemplate: task.template.optionTemplate,
+      dateRangeConfig: task.template.dateRangeConfig,
+      intervalDays: normalizeAutomationIntervalDays(schedule.intervalDays),
+      intervalHours: normalizeAutomationIntervalHours(schedule.intervalHours),
+      stopAtEnabled: stopAt > 0,
+      stopAtValue: stopAt > 0 ? toDateTimeLocalValue(stopAt) : '',
+      maxRunsEnabled: maxRuns > 0,
+      maxRuns: maxRuns > 0 ? maxRuns : 0
+    })
+    setIsAutomationModalOpen(true)
+  }, [exportFolder])
+
+  const openAutomationDateRangeDialog = useCallback(() => {
+    if (!automationTaskDraft) return
+    void (async () => {
+      if (isResolvingAutomationRangeBounds) return
+      setIsResolvingAutomationRangeBounds(true)
+      try {
+        const nextBounds = await resolveChatExportTimeRangeBounds(automationTaskDraft.sessionIds)
+        setAutomationRangeBounds(nextBounds)
+        if (nextBounds) {
+          const nextSelection = clampExportSelectionToBounds(automationRangeSelection, nextBounds)
+          if (!areExportSelectionsEqual(nextSelection, automationRangeSelection)) {
+            setAutomationRangeSelection(nextSelection)
+            setAutomationTaskDraft((prev) => prev ? {
+              ...prev,
+              dateRangeConfig: serializeExportDateRangeConfig(nextSelection)
+            } : prev)
+          }
+        }
+        setIsAutomationRangeDialogOpen(true)
+      } catch (error) {
+        console.error('自动化导出解析时间范围边界失败', error)
+        setAutomationRangeBounds(null)
+        setIsAutomationRangeDialogOpen(true)
+      } finally {
+        setIsResolvingAutomationRangeBounds(false)
+      }
+    })()
+  }, [
+    automationRangeSelection,
+    automationTaskDraft,
+    isResolvingAutomationRangeBounds,
+    resolveChatExportTimeRangeBounds
+  ])
+
+  const applyAutomationRangeMode = useCallback((mode: AutomationRangeMode) => {
+    if (!automationTaskDraft) return
+    if (mode === 'custom') {
+      openAutomationDateRangeDialog()
+      return
+    }
+    if (mode === 'lastNDays') {
+      const relativeDays = readAutomationLastNDays(automationTaskDraft.dateRangeConfig) || AUTOMATION_LAST_N_DAYS_DEFAULT
+      const nextSelection: ExportDateRangeSelection = {
+        preset: 'custom',
+        useAllTime: false,
+        dateRange: createDateRangeByLastNDays(relativeDays, new Date())
+      }
+      setAutomationRangeSelection(nextSelection)
+      setAutomationTaskDraft((prev) => prev ? {
+        ...prev,
+        dateRangeConfig: buildAutomationLastNDaysConfig(relativeDays)
+      } : prev)
+      return
+    }
+    const nextSelection = createAutomationSelectionByMode(mode, new Date())
+    setAutomationRangeSelection(nextSelection)
+    setAutomationTaskDraft((prev) => prev ? {
+      ...prev,
+      dateRangeConfig: serializeExportDateRangeConfig(nextSelection)
+    } : prev)
+  }, [automationTaskDraft, openAutomationDateRangeDialog])
+
+  const updateAutomationLastNDays = useCallback((value: unknown) => {
+    const days = normalizeAutomationLastNDays(value)
+    const nextSelection: ExportDateRangeSelection = {
+      preset: 'custom',
+      useAllTime: false,
+      dateRange: createDateRangeByLastNDays(days, new Date())
+    }
+    setAutomationRangeSelection(nextSelection)
+    setAutomationTaskDraft((prev) => prev ? {
+      ...prev,
+      dateRangeConfig: buildAutomationLastNDaysConfig(days)
+    } : prev)
+  }, [])
+
+  const saveAutomationTaskDraft = useCallback(() => {
+    if (!automationTaskDraft) return
+    if (!automationTasksReadyRef.current) {
+      automationTasksReadyRef.current = true
+    }
+    const normalizedName = automationTaskDraft.name.trim()
+    if (!normalizedName) {
+      window.alert('请输入任务名称')
+      return
+    }
+    if (automationTaskDraft.sessionIds.length === 0) {
+      window.alert('自动化任务至少需要一个会话')
+      return
+    }
+
+    const intervalDays = normalizeAutomationIntervalDays(automationTaskDraft.intervalDays)
+    const intervalHours = normalizeAutomationIntervalHours(automationTaskDraft.intervalHours)
+    if (intervalDays <= 0 && intervalHours <= 0) {
+      window.alert('执行间隔不能为 0，请至少设置天数或小时')
+      return
+    }
+    const schedule: ExportAutomationSchedule = { type: 'interval', intervalDays, intervalHours }
+    const stopAtTimestamp = automationTaskDraft.stopAtEnabled
+      ? parseDateTimeLocalValue(automationTaskDraft.stopAtValue)
+      : null
+    if (automationTaskDraft.stopAtEnabled && !stopAtTimestamp) {
+      window.alert('请填写有效的终止时间')
+      return
+    }
+    const maxRuns = automationTaskDraft.maxRunsEnabled
+      ? Math.max(0, Math.floor(Number(automationTaskDraft.maxRuns || 0)))
+      : 0
+    if (automationTaskDraft.maxRunsEnabled && maxRuns <= 0) {
+      window.alert('请填写大于 0 的最大执行次数')
+      return
+    }
+    const stopCondition = {
+      endAt: stopAtTimestamp && stopAtTimestamp > 0 ? stopAtTimestamp : undefined,
+      maxRuns: maxRuns > 0 ? maxRuns : undefined
+    }
+
+    const now = Date.now()
+    const condition: ExportAutomationCondition = { type: 'new-message-since-last-success' }
+    const nextTask: ExportAutomationTask = {
+      id: automationTaskDraft.mode === 'edit' && automationTaskDraft.id
+        ? automationTaskDraft.id
+        : createAutomationTaskId(),
+      name: normalizedName,
+      enabled: automationTaskDraft.enabled,
+      sessionIds: [...automationTaskDraft.sessionIds],
+      sessionNames: [...automationTaskDraft.sessionNames],
+      outputDir: automationTaskDraft.useGlobalOutputDir ? undefined : String(automationTaskDraft.outputDir || '').trim(),
+      schedule,
+      condition,
+      stopCondition: (stopCondition.endAt || stopCondition.maxRuns) ? stopCondition : undefined,
+      template: {
+        scope: automationTaskDraft.scope,
+        contentType: automationTaskDraft.contentType,
+        optionTemplate: { ...automationTaskDraft.optionTemplate },
+        dateRangeConfig: automationTaskDraft.dateRangeConfig
+      },
+      runState: automationTaskDraft.mode === 'edit'
+        ? automationTasksRef.current.find((item) => item.id === automationTaskDraft.id)?.runState
+        : { lastRunStatus: 'idle', successCount: 0 },
+      createdAt: automationTaskDraft.mode === 'edit'
+        ? (automationTasksRef.current.find((item) => item.id === automationTaskDraft.id)?.createdAt || now)
+        : now,
+      updatedAt: now
+    }
+
+    updateAutomationTasks((prev) => {
+      if (automationTaskDraft.mode === 'edit' && automationTaskDraft.id) {
+        return prev.map((task) => (task.id === automationTaskDraft.id ? nextTask : task))
+      }
+      return [nextTask, ...prev]
+    })
+    setAutomationTaskDraft(null)
+    setIsAutomationRangeDialogOpen(false)
+    setAutomationHint(automationTaskDraft.mode === 'edit' ? '自动化任务已更新' : '自动化任务已创建')
+  }, [automationTaskDraft, updateAutomationTasks])
 
   const markSessionExported = useCallback((sessionIds: string[], timestamp: number) => {
     setLastExportBySession(prev => {
@@ -4938,10 +5494,123 @@ function ExportPage() {
     }
   }, [])
 
+  const enqueueExportTask = useCallback((title: string, payload: ExportTaskPayload): string => {
+    const task: ExportTask = {
+      id: createTaskId(),
+      title,
+      status: 'queued',
+      settledSessionIds: [],
+      createdAt: Date.now(),
+      payload,
+      progress: createEmptyProgress(),
+      performance: payload.scope === 'content' && payload.contentType === 'text'
+        ? createEmptyTaskPerformance()
+        : undefined
+    }
+    setTasks(prev => [task, ...prev])
+    return task.id
+  }, [])
+
+  const buildAutomationExportOptions = useCallback((task: ExportAutomationTask): ElectronExportOptions => {
+    const selection = resolveAutomationDateRangeSelection(task.template.dateRangeConfig as any, new Date())
+    const dateRange = selection.useAllTime
+      ? null
+      : {
+          start: Math.floor(selection.dateRange.start.getTime() / 1000),
+          end: Math.floor(selection.dateRange.end.getTime() / 1000)
+        }
+    return {
+      ...task.template.optionTemplate,
+      dateRange
+    }
+  }, [])
+
+  const enqueueAutomationTask = useCallback((
+    task: ExportAutomationTask,
+    options?: { scheduleKey?: string; force?: boolean; reason?: string }
+  ): { queued: boolean; reason?: string } => {
+    const outputDir = String(task.outputDir || exportFolder || '').trim()
+    if (!outputDir) {
+      return { queued: false, reason: '导出目录未设置' }
+    }
+
+    const hasConflict = tasksRef.current.some((item) => {
+      if (item.status !== 'running' && item.status !== 'queued') return false
+      return item.payload.automationTaskId === task.id
+    })
+    if (hasConflict) {
+      return { queued: false, reason: '任务已有执行队列，本次触发已跳过' }
+    }
+
+    const exportOptions = buildAutomationExportOptions(task)
+    const contentType = task.template.contentType
+    const title = `自动化导出：${task.name}`
+    enqueueExportTask(title, {
+      sessionIds: task.sessionIds,
+      sessionNames: task.sessionNames,
+      outputDir,
+      options: exportOptions,
+      scope: task.template.scope,
+      source: 'automation',
+      automationTaskId: task.id,
+      contentType
+    })
+    const now = Date.now()
+    patchAutomationTask(task.id, (prev) => ({
+      ...prev,
+      updatedAt: now,
+      runState: {
+        ...(prev.runState || {}),
+        lastRunStatus: 'queued',
+        lastTriggeredAt: now,
+        lastSkipReason: undefined,
+        lastError: undefined,
+        lastScheduleKey: options?.scheduleKey || prev.runState?.lastScheduleKey
+      }
+    }))
+    if (options?.reason) {
+      setAutomationHint(options.reason)
+    }
+    return { queued: true }
+  }, [
+    buildAutomationExportOptions,
+    enqueueExportTask,
+    exportFolder,
+    patchAutomationTask
+  ])
+
+  const resolveAutomationHasNewMessages = useCallback(async (task: ExportAutomationTask): Promise<{ shouldRun: boolean; reason?: string }> => {
+    const lastSuccessAt = Number(task.runState?.lastSuccessAt || 0)
+    if (!lastSuccessAt) return { shouldRun: true }
+    const stats = await window.electronAPI.chat.getExportSessionStats(task.sessionIds, {
+      includeRelations: false,
+      allowStaleCache: true
+    })
+    if (!stats.success || !stats.data) {
+      return { shouldRun: false, reason: stats.error || '会话统计失败，已跳过' }
+    }
+    let latestTimestamp = 0
+    for (const sessionId of task.sessionIds) {
+      const raw = Number(stats.data?.[sessionId]?.lastTimestamp || 0)
+      if (Number.isFinite(raw) && raw > latestTimestamp) {
+        latestTimestamp = Math.max(0, Math.floor(raw))
+      }
+    }
+    if (latestTimestamp <= 0) {
+      return { shouldRun: false, reason: '未检测到可用会话时间戳，已跳过' }
+    }
+    const lastSuccessSeconds = Math.floor(lastSuccessAt / 1000)
+    if (latestTimestamp <= lastSuccessSeconds) {
+      return { shouldRun: false, reason: '目标会话无新消息，本次已跳过' }
+    }
+    return { shouldRun: true }
+  }, [])
+
   const createTask = async () => {
     if (!exportDialog.open || !exportFolder) return
     if (exportDialog.scope !== 'sns' && exportDialog.sessionIds.length === 0) return
 
+    const isAutomationCreateIntent = exportDialog.intent === 'automation-create'
     const exportOptions = exportDialog.scope === 'sns'
       ? undefined
       : buildExportOptions(exportDialog.scope, exportDialog.contentType)
@@ -4957,29 +5626,57 @@ function ExportPage() {
             ? '朋友圈批量导出'
             : `${contentTypeLabels[exportDialog.contentType || 'text']}批量导出`
 
-    const task: ExportTask = {
-      id: createTaskId(),
-      title,
-      status: 'queued',
-      settledSessionIds: [],
-      createdAt: Date.now(),
-      payload: {
-        sessionIds: exportDialog.sessionIds,
-        sessionNames: exportDialog.sessionNames,
+    if (isAutomationCreateIntent) {
+      if (!exportOptions || exportDialog.scope === 'sns') {
+        window.alert('自动化任务仅支持会话导出')
+        return
+      }
+      const { dateRange: _discard, ...optionTemplate } = exportOptions
+      const normalizedRangeSelection = cloneExportDateRangeSelection(timeRangeSelection)
+      const scope = exportDialog.scope === 'single'
+        ? 'single'
+        : exportDialog.scope === 'content'
+          ? 'content'
+          : 'multi'
+      setAutomationRangeSelection(normalizedRangeSelection)
+      setAutomationRangeBounds(null)
+      setAutomationTaskDraft({
+        mode: 'create',
+        name: exportDialog.sessionIds.length === 1
+          ? `${exportDialog.sessionNames[0] || '单会话'} 自动化导出`
+          : `自动化导出（${exportDialog.sessionIds.length} 个会话）`,
+        enabled: true,
+        sessionIds: [...exportDialog.sessionIds],
+        sessionNames: [...exportDialog.sessionNames],
         outputDir: exportFolder,
-        options: exportOptions,
-        scope: exportDialog.scope,
-        contentType: exportDialog.contentType,
-        snsOptions
-      },
-      progress: createEmptyProgress(),
-      performance: exportDialog.scope === 'content' && exportDialog.contentType === 'text'
-        ? createEmptyTaskPerformance()
-        : undefined
+        useGlobalOutputDir: true,
+        scope,
+        contentType: scope === 'content' ? exportDialog.contentType : undefined,
+        optionTemplate,
+        dateRangeConfig: serializeExportDateRangeConfig(normalizedRangeSelection),
+        intervalDays: 1,
+        intervalHours: 0,
+        stopAtEnabled: false,
+        stopAtValue: '',
+        maxRunsEnabled: false,
+        maxRuns: 0
+      })
+      setIsAutomationCreateMode(false)
+      setAutomationHint('导出配置已完成，请继续设置自动化规则并保存任务')
+      closeExportDialog()
+    } else {
+      enqueueExportTask(title, {
+          sessionIds: exportDialog.sessionIds,
+          sessionNames: exportDialog.sessionNames,
+          outputDir: exportFolder,
+          options: exportOptions,
+          scope: exportDialog.scope,
+          source: 'manual',
+          contentType: exportDialog.contentType,
+          snsOptions
+        })
+      closeExportDialog()
     }
-
-    setTasks(prev => [task, ...prev])
-    closeExportDialog()
 
     await configService.setExportDefaultFormat(options.format)
     await configService.setExportDefaultAvatars(options.exportAvatars)
@@ -5036,6 +5733,30 @@ function ExportPage() {
       })
       .map((item) => item.session)
   }, [resolveSessionExistingMessageCount])
+
+  const exitAutomationCreateMode = useCallback(() => {
+    setIsAutomationCreateMode(false)
+    setAutomationHint('已退出自动化任务创建')
+  }, [])
+
+  const openAutomationExportConfigDialog = useCallback(() => {
+    const selectedSet = new Set(selectedSessions)
+    const selectedRows = sessions.filter((session) => selectedSet.has(session.username))
+    const orderedRows = orderSessionsForExport(selectedRows)
+    if (orderedRows.length === 0) {
+      window.alert('请先勾选至少一个可导出的会话')
+      return
+    }
+    const ids = orderedRows.map((session) => session.username)
+    const names = orderedRows.map((session) => session.displayName || session.username)
+    openExportDialog({
+      scope: 'multi',
+      sessionIds: ids,
+      sessionNames: names,
+      title: `自动化任务导出配置（${ids.length} 个会话）`,
+      intent: 'automation-create'
+    })
+  }, [openExportDialog, orderSessionsForExport, selectedSessions, sessions])
 
   const openBatchExport = () => {
     const selectedSet = new Set(selectedSessions)
@@ -5121,6 +5842,181 @@ function ExportPage() {
     () => tasks.filter(task => task.status === 'running' || task.status === 'queued').length,
     [tasks]
   )
+
+  useEffect(() => {
+    const previous = automationQueueStatusByTaskIdRef.current
+    const next = new Map<string, TaskStatus>()
+    for (const task of tasks) {
+      if (task.payload.source !== 'automation' || !task.payload.automationTaskId) continue
+      const automationTaskId = task.payload.automationTaskId
+      next.set(task.id, task.status)
+      const previousStatus = previous.get(task.id)
+      if (previousStatus === task.status) continue
+
+      const now = Date.now()
+      if (task.status === 'running') {
+        patchAutomationTask(automationTaskId, (current) => ({
+          ...current,
+          updatedAt: now,
+          runState: {
+            ...(current.runState || {}),
+            lastRunStatus: 'running',
+            lastStartedAt: now,
+            lastSkipReason: undefined,
+            lastError: undefined
+          }
+        }))
+      } else if (task.status === 'success') {
+        patchAutomationTask(automationTaskId, (current) => ({
+          ...current,
+          updatedAt: now,
+          runState: {
+            ...(current.runState || {}),
+            lastRunStatus: 'success',
+            lastFinishedAt: now,
+            lastSuccessAt: now,
+            lastSkipReason: undefined,
+            lastError: undefined,
+            successCount: Math.max(0, Math.floor(Number(current.runState?.successCount || 0))) + 1
+          }
+        }))
+      } else if (task.status === 'error') {
+        patchAutomationTask(automationTaskId, (current) => ({
+          ...current,
+          updatedAt: now,
+          runState: {
+            ...(current.runState || {}),
+            lastRunStatus: 'error',
+            lastFinishedAt: now,
+            lastError: task.error || '导出失败'
+          }
+        }))
+      }
+    }
+    automationQueueStatusByTaskIdRef.current = next
+  }, [patchAutomationTask, tasks])
+
+  const evaluateAutomationSchedules = useCallback(async () => {
+    if (!automationTasksReadyRef.current) return
+    if (automationSchedulerRunningRef.current) return
+    automationSchedulerRunningRef.current = true
+    try {
+      const now = new Date()
+      const enabledTasks = automationTasksRef.current.filter((task) => task.enabled)
+      for (const task of enabledTasks) {
+        const successCount = Math.max(0, Math.floor(Number(task.runState?.successCount || 0)))
+        const maxRuns = Math.max(0, Math.floor(Number(task.stopCondition?.maxRuns || 0)))
+        if (maxRuns > 0 && successCount >= maxRuns) {
+          const stopAt = Date.now()
+          patchAutomationTask(task.id, (current) => ({
+            ...current,
+            enabled: false,
+            updatedAt: stopAt,
+            runState: {
+              ...(current.runState || {}),
+              lastRunStatus: 'skipped',
+              lastSkipAt: stopAt,
+              lastSkipReason: `已达到最大执行次数（${maxRuns} 次），任务已自动停用`,
+              successCount: Math.max(0, Math.floor(Number(current.runState?.successCount || 0)))
+            }
+          }))
+          continue
+        }
+
+        const endAt = Number(task.stopCondition?.endAt || 0)
+        if (endAt > 0 && now.getTime() > endAt) {
+          const stopAt = Date.now()
+          patchAutomationTask(task.id, (current) => ({
+            ...current,
+            enabled: false,
+            updatedAt: stopAt,
+            runState: {
+              ...(current.runState || {}),
+              lastRunStatus: 'skipped',
+              lastSkipAt: stopAt,
+              lastSkipReason: '已超过终止时间，任务已自动停用'
+            }
+          }))
+          continue
+        }
+
+        const scheduleKey = resolveAutomationDueScheduleKey(task, now)
+        if (!scheduleKey) continue
+        if (task.runState?.lastScheduleKey === scheduleKey) continue
+
+        const hasConflict = tasksRef.current.some((item) => {
+          if (item.status !== 'running' && item.status !== 'queued') return false
+          return item.payload.automationTaskId === task.id
+        })
+        if (hasConflict) {
+          markAutomationTaskSkipped(task.id, '任务仍在执行中，本次触发已跳过', scheduleKey)
+          continue
+        }
+
+        if (task.condition.type === 'new-message-since-last-success') {
+          const checkResult = await resolveAutomationHasNewMessages(task)
+          if (!checkResult.shouldRun) {
+            markAutomationTaskSkipped(task.id, checkResult.reason || '无新消息，本次触发已跳过', scheduleKey)
+            continue
+          }
+        }
+
+        const queued = enqueueAutomationTask(task, { scheduleKey })
+        if (!queued.queued) {
+          markAutomationTaskSkipped(task.id, queued.reason || '触发失败，本次已跳过', scheduleKey)
+        }
+      }
+    } finally {
+      automationSchedulerRunningRef.current = false
+    }
+  }, [
+    enqueueAutomationTask,
+    markAutomationTaskSkipped,
+    patchAutomationTask,
+    resolveAutomationHasNewMessages
+  ])
+
+  useEffect(() => {
+    let cancelled = false
+    const run = async () => {
+      if (cancelled) return
+      if (!automationTasksReadyRef.current) return
+      try {
+        await evaluateAutomationSchedules()
+      } catch (error) {
+        console.error('自动化导出调度失败:', error)
+      }
+    }
+    void run()
+    const timer = window.setInterval(() => {
+      void run()
+    }, 30_000)
+    return () => {
+      cancelled = true
+      window.clearInterval(timer)
+    }
+  }, [evaluateAutomationSchedules])
+
+  const runAutomationTaskNow = useCallback((taskId: string) => {
+    const target = automationTasksRef.current.find((task) => task.id === taskId)
+    if (!target) return
+    const queued = enqueueAutomationTask(target, {
+      reason: `已手动触发「${target.name}」`,
+      scheduleKey: target.runState?.lastScheduleKey
+    })
+    if (!queued.queued) {
+      markAutomationTaskSkipped(taskId, queued.reason || '手动触发失败')
+      setAutomationHint(queued.reason || '手动触发失败')
+      return
+    }
+    setAutomationHint(`已加入队列：${target.name}`)
+  }, [enqueueAutomationTask, markAutomationTaskSkipped])
+
+  useEffect(() => {
+    if (!automationHint) return
+    const timer = window.setTimeout(() => setAutomationHint(null), 2600)
+    return () => window.clearTimeout(timer)
+  }, [automationHint])
 
   const inProgressSessionIdsKey = useMemo(
     () => inProgressSessionIds.join('||'),
@@ -6472,6 +7368,7 @@ function ExportPage() {
   const canCreateTask = exportDialog.scope === 'sns'
     ? Boolean(exportFolder)
     : Boolean(exportFolder) && exportDialog.sessionIds.length > 0
+  const isAutomationCreateDialog = exportDialog.intent === 'automation-create'
   const scopeLabel = exportDialog.scope === 'single'
     ? '单会话'
     : exportDialog.scope === 'multi'
@@ -6601,19 +7498,15 @@ function ExportPage() {
   const taskQueuedCount = tasks.filter(task => task.status === 'queued').length
   const taskCenterAlertCount = taskRunningCount + taskQueuedCount
   const hasFilteredContacts = filteredContacts.length > 0
-  const CONTACTS_ACTION_STICKY_WIDTH = 184
-  const contactsTableMinWidth = useMemo(() => {
-    const baseWidth = 24 + 34 + 44 + 280 + 120 + (4 * 72) + CONTACTS_ACTION_STICKY_WIDTH + (8 * 12)
-    const snsWidth = shouldShowSnsColumn ? 72 + 12 : 0
-    const mutualFriendsWidth = shouldShowMutualFriendsColumn ? 72 + 12 : 0
-    return baseWidth + snsWidth + mutualFriendsWidth
-  }, [shouldShowMutualFriendsColumn, shouldShowSnsColumn])
+  const optionalMetricColumnCount = (shouldShowSnsColumn ? 1 : 0) + (shouldShowMutualFriendsColumn ? 1 : 0)
+  const contactsMetricColumnCount = 4 + optionalMetricColumnCount
+  const contactsColumnGapCount = 6 + optionalMetricColumnCount
   const contactsTableStyle = useMemo(() => (
     {
-      ['--contacts-table-min-width' as const]: `${contactsTableMinWidth}px`
+      ['--contacts-table-min-width' as const]: `calc((2 * var(--contacts-inline-padding)) + var(--contacts-left-sticky-width) + var(--contacts-message-col-width) + (${contactsMetricColumnCount} * var(--contacts-media-col-width)) + var(--contacts-actions-sticky-width) + (${contactsColumnGapCount} * var(--contacts-column-gap)))`
     } as CSSProperties
-  ), [contactsTableMinWidth])
-  const hasContactsHorizontalOverflow = contactsHorizontalScrollMetrics.contentWidth - contactsHorizontalScrollMetrics.viewportWidth > 1
+  ), [contactsColumnGapCount, contactsMetricColumnCount])
+  const hasContactsHorizontalOverflow = contactsHorizontalScrollMetrics.contentWidth - contactsHorizontalScrollMetrics.viewportWidth > 4
   const contactsBottomScrollbarInnerStyle = useMemo<CSSProperties>(() => ({
     width: `${Math.max(contactsHorizontalScrollMetrics.contentWidth, contactsHorizontalScrollMetrics.viewportWidth)}px`
   }), [contactsHorizontalScrollMetrics.contentWidth, contactsHorizontalScrollMetrics.viewportWidth])
@@ -6794,6 +7687,43 @@ function ExportPage() {
   const toggleTaskPerfDetail = useCallback((taskId: string) => {
     setExpandedPerfTaskId(prev => (prev === taskId ? null : taskId))
   }, [])
+
+  const toggleAutomationTaskEnabled = useCallback((taskId: string, enabled: boolean) => {
+    const now = Date.now()
+    patchAutomationTask(taskId, (task) => ({
+      ...task,
+      enabled,
+      updatedAt: now
+    }))
+    setAutomationHint(enabled ? '自动化任务已启用' : '自动化任务已停用')
+  }, [patchAutomationTask])
+
+  const deleteAutomationTask = useCallback((taskId: string) => {
+    const target = automationTasksRef.current.find((task) => task.id === taskId)
+    if (!target) return
+    const confirmed = window.confirm(`确认删除自动化任务「${target.name}」吗？`)
+    if (!confirmed) return
+    updateAutomationTasks((prev) => prev.filter((task) => task.id !== taskId))
+    setAutomationHint('自动化任务已删除')
+  }, [updateAutomationTasks])
+
+  const chooseAutomationDraftOutputDir = useCallback(async () => {
+    if (!automationTaskDraft) return
+    const result = await window.electronAPI.dialog.openFile({
+      title: '选择任务导出目录',
+      properties: ['openDirectory']
+    })
+    if (result.canceled || result.filePaths.length === 0) return
+    const outputDir = result.filePaths[0]
+    setAutomationTaskDraft((prev) => {
+      if (!prev) return prev
+      return {
+        ...prev,
+        outputDir,
+        useGlobalOutputDir: false
+      }
+    })
+  }, [automationTaskDraft])
   const renderContactRow = useCallback((index: number, contact: ContactInfo) => {
     const matchedSession = sessionRowByUsername.get(contact.username)
     const canExport = Boolean(matchedSession?.hasSession)
@@ -6803,6 +7733,7 @@ function ExportPage() {
     const isQueued = canExport && queuedSessionIds.has(contact.username)
     const recentExportTimestamp = lastExportBySession[contact.username]
     const hasRecentExport = canExport && Boolean(recentExportTimestamp)
+    const showRecentExport = !isAutomationCreateMode && hasRecentExport
     const recentExportTime = hasRecentExport ? formatRecentExportTime(recentExportTimestamp, nowTick) : ''
     const countedMessages = normalizeMessageCount(sessionMessageCounts[contact.username])
     const hintedMessages = normalizeMessageCount(matchedSession?.messageCountHint)
@@ -6866,6 +7797,7 @@ function ExportPage() {
     const nextCanExport = Boolean(nextContact && sessionRowByUsername.get(nextContact.username)?.hasSession)
     const previousSelected = Boolean(previousContact && previousCanExport && selectedSessions.has(previousContact.username))
     const nextSelected = Boolean(nextContact && nextCanExport && selectedSessions.has(nextContact.username))
+    const resolvedAvatarUrl = normalizeExportAvatarUrl(matchedSession?.avatarUrl || contact.avatarUrl)
     const rowClassName = [
       'contact-row',
       checked ? 'selected' : '',
@@ -6889,7 +7821,7 @@ function ExportPage() {
             </div>
             <div className="contact-avatar">
               <Avatar
-                src={normalizeExportAvatarUrl(contact.avatarUrl)}
+                src={resolvedAvatarUrl}
                 name={contact.displayName}
                 size="100%"
                 shape="rounded"
@@ -6992,24 +7924,26 @@ function ExportPage() {
             </div>
           )}
           <div className="row-action-cell">
-            <div className={`row-action-main ${hasRecentExport ? '' : 'single-line'}`.trim()}>
-              <div className={`row-export-action-stack ${hasRecentExport ? '' : 'single-line'}`.trim()}>
-                <button
-                  type="button"
-                  className={`row-export-link ${isRunning ? 'state-running' : ''} ${!canExport ? 'state-disabled' : ''}`}
-                  disabled={!canExport || isRunning}
-                  onClick={() => {
-                    if (!matchedSession || !matchedSession.hasSession) return
-                    openSingleExport({
-                      ...matchedSession,
-                      displayName: contact.displayName || matchedSession.displayName || matchedSession.username
-                    })
-                  }}
-                >
-                  {!canExport ? '暂无会话' : isRunning ? '导出中...' : isQueued ? '排队中' : '导出'}
-                </button>
-                {hasRecentExport && <span className="row-export-time">{recentExportTime}</span>}
-              </div>
+            <div className={`row-action-main ${showRecentExport ? '' : 'single-line'}`.trim()}>
+              {!isAutomationCreateMode && (
+                <div className={`row-export-action-stack ${showRecentExport ? '' : 'single-line'}`.trim()}>
+                  <button
+                    type="button"
+                    className={`row-export-link ${isRunning ? 'state-running' : ''} ${!canExport ? 'state-disabled' : ''}`}
+                    disabled={!canExport || isRunning}
+                    onClick={() => {
+                      if (!matchedSession || !matchedSession.hasSession) return
+                      openSingleExport({
+                        ...matchedSession,
+                        displayName: contact.displayName || matchedSession.displayName || matchedSession.username
+                      })
+                    }}
+                  >
+                    {!canExport ? '暂无会话' : isRunning ? '导出中...' : isQueued ? '排队中' : '导出'}
+                  </button>
+                  {showRecentExport && <span className="row-export-time">{recentExportTime}</span>}
+                </div>
+              )}
               <button
                 className={`row-detail-btn ${showSessionDetailPanel && sessionDetail?.wxid === contact.username ? 'active' : ''}`}
                 onClick={() => openSessionDetail(contact.username)}
@@ -7023,6 +7957,7 @@ function ExportPage() {
     )
   }, [
     filteredContacts,
+    isAutomationCreateMode,
     lastExportBySession,
     navigate,
     nowTick,
@@ -7093,6 +8028,9 @@ function ExportPage() {
     if (patch.dateRange) {
       setExportDefaultDateRangeSelection(patch.dateRange)
     }
+    if (patch.fileNamingMode) {
+      setExportDefaultFileNamingMode(patch.fileNamingMode)
+    }
     if (patch.media) {
       const mediaPatch = patch.media
       setExportDefaultMedia(mediaPatch)
@@ -7116,6 +8054,10 @@ function ExportPage() {
       setExportDefaultConcurrency(patch.concurrency)
     }
   }, [])
+
+  const sortedAutomationTasks = useMemo(() => (
+    [...automationTasks].sort((a, b) => Number(b.updatedAt || 0) - Number(a.updatedAt || 0))
+  ), [automationTasks])
 
   return (
     <div className="export-board-page">
@@ -7161,6 +8103,16 @@ function ExportPage() {
               <button
                 className="more-export-settings-btn"
                 type="button"
+                onClick={() => {
+                  setIsAutomationCreateMode(false)
+                  setIsAutomationModalOpen(true)
+                }}
+              >
+                自动化导出
+              </button>
+              <button
+                className="more-export-settings-btn"
+                type="button"
                 onClick={() => setIsExportDefaultsModalOpen(true)}
               >
                 更多导出设置
@@ -7179,6 +8131,9 @@ function ExportPage() {
             )}
           </button>
         </div>
+        {automationHint && (
+          <div className="automation-hint-pill">{automationHint}</div>
+        )}
       </div>
 
       <TaskCenterModal
@@ -7191,6 +8146,368 @@ function ExportPage() {
         onClose={closeTaskCenter}
         onTogglePerfTask={toggleTaskPerfDetail}
       />
+
+      {isAutomationModalOpen && createPortal(
+        <div
+          className="automation-modal-overlay"
+          onClick={() => {
+            setIsAutomationModalOpen(false)
+            setAutomationTaskDraft(null)
+            setIsAutomationRangeDialogOpen(false)
+          }}
+        >
+          <div
+            className="automation-modal"
+            role="dialog"
+            aria-modal="true"
+            aria-label="自动化导出任务"
+            onClick={(event) => event.stopPropagation()}
+          >
+            <div className="automation-modal-header">
+              <div>
+                <h3>自动化导出</h3>
+                <p>仅在应用运行期间生效；错过触发不会补跑。</p>
+              </div>
+              <div style={{ display: 'flex', alignItems: 'center', gap: '8px' }}>
+                <button
+                  type="button"
+                  className="secondary-btn"
+                  onClick={openCreateAutomationDraft}
+                >
+                  新建任务
+                </button>
+                <button
+                  className="close-icon-btn"
+                  type="button"
+                  onClick={() => {
+                    setIsAutomationModalOpen(false)
+                    setAutomationTaskDraft(null)
+                    setIsAutomationRangeDialogOpen(false)
+                  }}
+                  aria-label="关闭自动化导出"
+                >
+                  <X size={16} />
+                </button>
+              </div>
+            </div>
+
+            <div className="automation-modal-body">
+              {sortedAutomationTasks.length === 0 ? (
+                <div className="automation-empty">
+                  暂无自动化任务。点击右上角「新建任务」开始配置。
+                </div>
+              ) : (
+                <div className="automation-task-list">
+                  {sortedAutomationTasks.map((task) => {
+                    const linkedQueueTask = tasks.find((item) => (
+                      (item.status === 'running' || item.status === 'queued') &&
+                      item.payload.automationTaskId === task.id
+                    ))
+                    const queueState: 'queued' | 'running' | null = linkedQueueTask?.status === 'running'
+                      ? 'running'
+                      : linkedQueueTask?.status === 'queued'
+                        ? 'queued'
+                        : null
+                    return (
+                      <div key={task.id} className={`automation-task-card ${task.enabled ? '' : 'disabled'}`.trim()}>
+                        <div className="automation-task-main">
+                          <div className="automation-task-title-row">
+                            <strong>{task.name}</strong>
+                            <span className={`automation-task-status ${task.enabled ? 'enabled' : 'disabled'}`}>
+                              {task.enabled ? '已启用' : '已停用'}
+                            </span>
+                            {queueState === 'running' && <span className="automation-task-status running">执行中</span>}
+                            {queueState === 'queued' && <span className="automation-task-status queued">排队中</span>}
+                          </div>
+                          <p>{formatAutomationScheduleLabel(task.schedule)}</p>
+                          <p>时间范围：{formatAutomationRangeLabel(task.template.dateRangeConfig as any)}</p>
+                          <p>会话范围：{task.sessionIds.length} 个</p>
+                          <p>导出目录：{task.outputDir || `${exportFolder || '未设置'}（全局）`}</p>
+                          <p>当前状态：{formatAutomationCurrentState(task, queueState, nowTick)}</p>
+                          <p>终止条件：{formatAutomationStopCondition(task)}</p>
+                          <p>最近结果：{formatAutomationLastRunSummary(task)}</p>
+                        </div>
+                        <div className="automation-task-actions">
+                          <button
+                            type="button"
+                            className="task-action-btn"
+                            onClick={() => toggleAutomationTaskEnabled(task.id, !task.enabled)}
+                          >
+                            {task.enabled ? '停用' : '启用'}
+                          </button>
+                          <button
+                            type="button"
+                            className="task-action-btn"
+                            onClick={() => runAutomationTaskNow(task.id)}
+                          >
+                            立即执行
+                          </button>
+                          <button
+                            type="button"
+                            className="task-action-btn"
+                            onClick={() => openEditAutomationTaskDraft(task)}
+                          >
+                            编辑
+                          </button>
+                          <button
+                            type="button"
+                            className="task-action-btn danger"
+                            onClick={() => deleteAutomationTask(task.id)}
+                          >
+                            删除
+                          </button>
+                        </div>
+                      </div>
+                    )
+                  })}
+                </div>
+              )}
+            </div>
+          </div>
+        </div>,
+        document.body
+      )}
+
+      {automationTaskDraft && createPortal(
+        <div className="automation-editor-overlay" onClick={() => {
+          setAutomationTaskDraft(null)
+          setIsAutomationRangeDialogOpen(false)
+        }}>
+          <div
+            className="automation-editor-modal"
+            role="dialog"
+            aria-modal="true"
+            aria-label="编辑自动化任务"
+            onClick={(event) => event.stopPropagation()}
+          >
+            <div className="automation-editor-header">
+              <h3>{automationTaskDraft.mode === 'edit' ? '编辑自动化任务' : '创建自动化任务'}</h3>
+              <button
+                className="close-icon-btn"
+                type="button"
+                onClick={() => {
+                  setAutomationTaskDraft(null)
+                  setIsAutomationRangeDialogOpen(false)
+                }}
+                aria-label="关闭自动化任务编辑"
+              >
+                <X size={16} />
+              </button>
+            </div>
+            <div className="automation-editor-body">
+              <label className="automation-form-field">
+                <span>任务名称</span>
+                <input
+                  type="text"
+                  value={automationTaskDraft.name}
+                  onChange={(event) => setAutomationTaskDraft((prev) => prev ? { ...prev, name: event.target.value } : prev)}
+                  placeholder="例如：工作日会话归档"
+                />
+              </label>
+
+              <div className="automation-inline-time">
+                <label className="automation-form-field">
+                  <span>间隔天数</span>
+                  <input
+                    type="number"
+                    min={0}
+                    value={automationTaskDraft.intervalDays}
+                    onChange={(event) => setAutomationTaskDraft((prev) => prev ? {
+                      ...prev,
+                      intervalDays: normalizeAutomationIntervalDays(event.target.value)
+                    } : prev)}
+                  />
+                </label>
+                <label className="automation-form-field">
+                  <span>间隔小时</span>
+                  <input
+                    type="number"
+                    min={0}
+                    max={23}
+                    value={automationTaskDraft.intervalHours}
+                    onChange={(event) => setAutomationTaskDraft((prev) => prev ? {
+                      ...prev,
+                      intervalHours: normalizeAutomationIntervalHours(event.target.value)
+                    } : prev)}
+                  />
+                </label>
+              </div>
+
+              <div className="automation-form-field">
+                <span>导出时间范围（按触发时间动态计算）</span>
+                <div className="automation-segment-row">
+                  {AUTOMATION_RANGE_OPTIONS.map((option) => {
+                    const active = resolveAutomationRangeMode(automationTaskDraft.dateRangeConfig as any, automationRangeSelection) === option.mode
+                    return (
+                      <button
+                        key={option.mode}
+                        type="button"
+                        className={`automation-segment-btn ${active ? 'active' : ''}`.trim()}
+                        onClick={() => applyAutomationRangeMode(option.mode)}
+                      >
+                        {option.label}
+                      </button>
+                    )
+                  })}
+                </div>
+                {resolveAutomationRangeMode(automationTaskDraft.dateRangeConfig as any, automationRangeSelection) === 'lastNDays' && (
+                  <label className="automation-form-field">
+                    <span>往前天数</span>
+                    <input
+                      type="number"
+                      min={AUTOMATION_LAST_N_DAYS_MIN}
+                      max={AUTOMATION_LAST_N_DAYS_MAX}
+                      value={readAutomationLastNDays(automationTaskDraft.dateRangeConfig) || AUTOMATION_LAST_N_DAYS_DEFAULT}
+                      onChange={(event) => updateAutomationLastNDays(event.target.value)}
+                    />
+                  </label>
+                )}
+                <div className="automation-path-row">
+                  <span>{formatAutomationRangeLabel(automationTaskDraft.dateRangeConfig as any, automationRangeSelection)}</span>
+                  {resolveAutomationRangeMode(automationTaskDraft.dateRangeConfig as any, automationRangeSelection) === 'custom' && (
+                    <button
+                      type="button"
+                      className="task-action-btn"
+                      onClick={openAutomationDateRangeDialog}
+                      disabled={isResolvingAutomationRangeBounds}
+                    >
+                      {isResolvingAutomationRangeBounds ? '解析中...' : '编辑完整时间'}
+                    </button>
+                  )}
+                </div>
+              </div>
+
+              <div className="automation-form-field">
+                <span>终止条件（可选）</span>
+                <label className="automation-inline-check">
+                  <input
+                    type="checkbox"
+                    checked={automationTaskDraft.stopAtEnabled}
+                    onChange={(event) => setAutomationTaskDraft((prev) => prev ? {
+                      ...prev,
+                      stopAtEnabled: event.target.checked
+                    } : prev)}
+                  />
+                  到指定时间后自动停止
+                </label>
+                {automationTaskDraft.stopAtEnabled && (
+                  <div className="automation-stopat-picker">
+                    <input
+                      type="date"
+                      className="automation-stopat-date"
+                      value={automationTaskDraft.stopAtValue ? automationTaskDraft.stopAtValue.slice(0, 10) : ''}
+                      onChange={(e) => {
+                        const datePart = e.target.value
+                        const timePart = automationTaskDraft.stopAtValue?.slice(11) || '23:59'
+                        setAutomationTaskDraft((prev) => prev ? { ...prev, stopAtValue: datePart ? `${datePart}T${timePart}` : '' } : prev)
+                      }}
+                    />
+                    <input
+                      type="time"
+                      className="automation-stopat-time"
+                      value={automationTaskDraft.stopAtValue ? automationTaskDraft.stopAtValue.slice(11) : '23:59'}
+                      onChange={(e) => {
+                        const timePart = e.target.value
+                        const datePart = automationTaskDraft.stopAtValue?.slice(0, 10) || new Date().toISOString().slice(0, 10)
+                        setAutomationTaskDraft((prev) => prev ? { ...prev, stopAtValue: `${datePart}T${timePart}` } : prev)
+                      }}
+                    />
+                  </div>
+                )}
+
+
+                <label className="automation-inline-check">
+                  <input
+                    type="checkbox"
+                    checked={automationTaskDraft.maxRunsEnabled}
+                    onChange={(event) => setAutomationTaskDraft((prev) => prev ? {
+                      ...prev,
+                      maxRunsEnabled: event.target.checked
+                    } : prev)}
+                  />
+                  成功执行指定次数后自动停止
+                </label>
+                {automationTaskDraft.maxRunsEnabled && (
+                  <input
+                    type="number"
+                    min={1}
+                    value={automationTaskDraft.maxRuns}
+                    onChange={(event) => setAutomationTaskDraft((prev) => prev ? {
+                      ...prev,
+                      maxRuns: Math.max(0, Math.floor(Number(event.target.value) || 0))
+                    } : prev)}
+                  />
+                )}
+              </div>
+
+              <div className="automation-form-field">
+                <span>导出目录</span>
+                <label className="automation-inline-check">
+                  <input
+                    type="checkbox"
+                    checked={automationTaskDraft.useGlobalOutputDir}
+                    onChange={(event) => setAutomationTaskDraft((prev) => prev ? {
+                      ...prev,
+                      useGlobalOutputDir: event.target.checked
+                    } : prev)}
+                  />
+                  使用全局导出目录
+                </label>
+                {!automationTaskDraft.useGlobalOutputDir && (
+                  <div className="automation-path-row">
+                    <button type="button" className="task-action-btn" onClick={() => void chooseAutomationDraftOutputDir()}>
+                      选择目录
+                    </button>
+                    <span>{automationTaskDraft.outputDir || '未设置'}</span>
+                  </div>
+                )}
+              </div>
+
+              <label className="automation-inline-check">
+                <input
+                  type="checkbox"
+                  checked={automationTaskDraft.enabled}
+                  onChange={(event) => setAutomationTaskDraft((prev) => prev ? { ...prev, enabled: event.target.checked } : prev)}
+                />
+                创建后立即启用
+              </label>
+
+              <div className="automation-draft-summary">
+                会话：{automationTaskDraft.sessionIds.length} 个 · 间隔：{automationTaskDraft.intervalDays} 天 {automationTaskDraft.intervalHours} 小时 · 时间：{formatAutomationRangeLabel(automationTaskDraft.dateRangeConfig as any, automationRangeSelection)} · 条件：有新消息才导出
+              </div>
+            </div>
+            <div className="automation-editor-actions">
+              <button
+                type="button"
+                className="secondary-btn"
+                onClick={() => {
+                  setAutomationTaskDraft(null)
+                  setIsAutomationRangeDialogOpen(false)
+                }}
+              >
+                取消
+              </button>
+              <button type="button" className="primary-btn" onClick={saveAutomationTaskDraft}>保存任务</button>
+            </div>
+            <ExportDateRangeDialog
+              open={isAutomationRangeDialogOpen}
+              value={automationRangeSelection}
+              minDate={automationRangeBounds?.minDate}
+              maxDate={automationRangeBounds?.maxDate}
+              onClose={() => setIsAutomationRangeDialogOpen(false)}
+              onConfirm={(nextSelection) => {
+                setAutomationRangeSelection(nextSelection)
+                setAutomationTaskDraft((prev) => prev ? {
+                  ...prev,
+                  dateRangeConfig: serializeExportDateRangeConfig(nextSelection)
+                } : prev)
+                setIsAutomationRangeDialogOpen(false)
+              }}
+            />
+          </div>
+        </div>,
+        document.body
+      )}
 
       {isExportDefaultsModalOpen && createPortal(
         <div
@@ -7282,24 +8599,26 @@ function ExportPage() {
                   </div>
                 ))}
               </div>
-              <button
-                className={`card-export-btn ${isPrimaryCard ? 'primary' : 'secondary'} ${isCardRunning ? 'running' : ''}`}
-                disabled={isCardRunning}
-                onClick={() => {
-                  if (card.type === 'sns') {
-                    openSnsExport()
-                    return
-                  }
-                  openContentExport(card.type)
-                }}
-              >
-                {isCardRunning ? (
-                  <>
-                    <span>批量导出中</span>
-                    <Loader2 size={14} className="spin" />
-                  </>
-                ) : '批量导出'}
-              </button>
+              {!isAutomationCreateMode && (
+                <button
+                  className={`card-export-btn ${isPrimaryCard ? 'primary' : 'secondary'} ${isCardRunning ? 'running' : ''}`}
+                  disabled={isCardRunning}
+                  onClick={() => {
+                    if (card.type === 'sns') {
+                      openSnsExport()
+                      return
+                    }
+                    openContentExport(card.type)
+                  }}
+                >
+                  {isCardRunning ? (
+                    <>
+                      <span>批量导出中</span>
+                      <Loader2 size={14} className="spin" />
+                    </>
+                  ) : '批量导出'}
+                </button>
+              )}
             </div>
           )
         })}
@@ -7315,6 +8634,18 @@ function ExportPage() {
             '你可以先在列表中筛选目标会话，再批量导出，结果会保留每个会话的结构与时间线。'
           ]}
         />
+        {isAutomationCreateMode && (
+          <div className="automation-create-mode-pill">
+            <span>自动化创建中：先勾选联系人，再点击「加入任务」</span>
+            <button
+              type="button"
+              className="secondary-btn"
+              onClick={exitAutomationCreateMode}
+            >
+              退出
+            </button>
+          </div>
+        )}
         <button
           className={`session-load-detail-entry ${showSessionLoadDetailModal ? 'open' : ''} ${isSessionLoadDetailActive && !showSessionLoadDetailModal ? 'active' : ''}`.trim()}
           type="button"
@@ -7425,6 +8756,15 @@ function ExportPage() {
                           <span className="contacts-list-header-media">共同好友</span>
                         )}
                         <span className="contacts-list-header-actions">
+                          {isAutomationCreateMode && (
+                            <button
+                              className="selection-clear-btn"
+                              type="button"
+                              onClick={exitAutomationCreateMode}
+                            >
+                              退出创建
+                            </button>
+                          )}
                           {selectedCount > 0 && (
                             <>
                               <button
@@ -7437,9 +8777,9 @@ function ExportPage() {
                               <button
                                 className="selection-export-btn"
                                 type="button"
-                                onClick={openBatchExport}
+                                onClick={isAutomationCreateMode ? openAutomationExportConfigDialog : openBatchExport}
                               >
-                                <span>批量导出</span>
+                                <span>{isAutomationCreateMode ? '加入任务' : '批量导出'}</span>
                                 <span className="selection-export-count">{selectedCount}</span>
                               </button>
                             </>
@@ -8272,20 +9612,24 @@ function ExportPage() {
                 </div>
               )}
 
-              <div className="dialog-section">
-                <div className="section-header-action">
-                  <h4>时间范围</h4>
-                  <button
-                    type="button"
-                    className="time-range-trigger"
-                    onClick={openTimeRangeDialog}
-                    disabled={isResolvingTimeRangeBounds}
-                  >
-                    <span>{isResolvingTimeRangeBounds ? '正在统计可选时间...' : timeRangeSummaryLabel}</span>
-                    <span className="time-range-arrow">&gt;</span>
-                  </button>
+
+
+              {!isAutomationCreateDialog && (
+                <div className="dialog-section">
+                  <div className="section-header-action">
+                    <h4>时间范围</h4>
+                    <button
+                      type="button"
+                      className="time-range-trigger"
+                      onClick={openTimeRangeDialog}
+                      disabled={isResolvingTimeRangeBounds}
+                    >
+                      <span>{isResolvingTimeRangeBounds ? '正在统计可选时间...' : timeRangeSummaryLabel}</span>
+                      <span className="time-range-arrow">&gt;</span>
+                    </button>
+                  </div>
                 </div>
-              </div>
+              )}
 
               {shouldShowMediaSection && (
                 <div className="dialog-section">
@@ -8411,27 +9755,51 @@ function ExportPage() {
                 </div>
               )}
 
-              {shouldShowDisplayNameSection && (
+              {(shouldShowDisplayNameSection || options.format === 'excel') && (
                 <div className="dialog-section">
-                  <h4>发送者名称显示</h4>
-                  <div className="display-name-options" role="radiogroup" aria-label="发送者名称显示">
-                    {displayNameOptions.map(option => {
-                      const isActive = options.displayNamePreference === option.value
-                      return (
-                        <button
-                          key={option.value}
-                          type="button"
-                          role="radio"
-                          aria-checked={isActive}
-                          className={`display-name-item ${isActive ? 'active' : ''}`}
-                          onClick={() => setOptions(prev => ({ ...prev, displayNamePreference: option.value }))}
-                        >
-                          <span>{option.label}</span>
-                          <small>{option.desc}</small>
-                        </button>
-                      )
-                    })}
-                  </div>
+                  {shouldShowDisplayNameSection && (
+                    <>
+                      <h4>发送者名称显示</h4>
+                      <div className="display-name-options" role="radiogroup" aria-label="发送者名称显示">
+                        {displayNameOptions.map(option => {
+                          const isActive = options.displayNamePreference === option.value
+                          return (
+                            <button
+                              key={option.value}
+                              type="button"
+                              role="radio"
+                              aria-checked={isActive}
+                              className={`display-name-item ${isActive ? 'active' : ''}`}
+                              onClick={() => setOptions(prev => ({ ...prev, displayNamePreference: option.value }))}
+                            >
+                              <span>{option.label}</span>
+                              <small>{option.desc}</small>
+                            </button>
+                          )
+                        })}
+                      </div>
+                    </>
+                  )}
+
+                  {options.format === 'excel' && (
+                    <div className={`dialog-switch-row ${shouldShowDisplayNameSection ? 'nested-row' : ''}`} style={shouldShowDisplayNameSection ? { marginTop: '12px', paddingTop: '12px', borderTop: '1px solid var(--border-light)' } : {}}>
+                      <div className="dialog-switch-copy">
+                        <h4>导出完整列</h4>
+                        <div className="format-note">
+                          开启后会在 Excel 表格中拆分出「发送者昵称」、「微信ID」、「备注」等列；群聊会额外包含「群昵称」列，私聊不会显示这一列。关闭则只保留紧凑的「发送者身份」。
+                        </div>
+                      </div>
+                      <button
+                        type="button"
+                        className={`dialog-switch ${!options.excelCompactColumns ? 'on' : ''}`}
+                        aria-pressed={!options.excelCompactColumns}
+                        aria-label="切换导出完整列"
+                        onClick={() => setOptions(prev => ({ ...prev, excelCompactColumns: !prev.excelCompactColumns }))}
+                      >
+                        <span className="dialog-switch-thumb" />
+                      </button>
+                    </div>
+                  )}
                 </div>
               )}
             </div>
@@ -8439,7 +9807,7 @@ function ExportPage() {
             <div className="dialog-actions">
               <button className="secondary-btn" onClick={closeExportDialog}>取消</button>
               <button className="primary-btn" onClick={() => void createTask()} disabled={!canCreateTask}>
-                <Download size={14} /> 创建导出任务
+                <Download size={14} /> {isAutomationCreateDialog ? '下一步：自动化规则' : '创建导出任务'}
               </button>
             </div>
 

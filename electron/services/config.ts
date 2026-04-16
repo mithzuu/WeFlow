@@ -5,6 +5,13 @@ import Store from 'electron-store'
 
 // 加密前缀标记
 const SAFE_PREFIX = 'safe:'  // safeStorage 加密（普通模式）
+const isSafeStorageAvailable = (): boolean => {
+  try {
+    return typeof safeStorage?.isEncryptionAvailable === 'function' && safeStorage.isEncryptionAvailable()
+  } catch {
+    return false
+  }
+}
 const LOCK_PREFIX = 'lock:'  // 密码派生密钥加密（锁定模式）
 
 interface ConfigSchema {
@@ -54,6 +61,8 @@ interface ConfigSchema {
   notificationFilterMode: 'all' | 'whitelist' | 'blacklist'
   notificationFilterList: string[]
   messagePushEnabled: boolean
+  messagePushFilterMode: 'all' | 'whitelist' | 'blacklist'
+  messagePushFilterList: string[]
   httpApiEnabled: boolean
   httpApiPort: number
   httpApiHost: string
@@ -62,10 +71,51 @@ interface ConfigSchema {
   quoteLayout: 'quote-top' | 'quote-bottom'
   wordCloudExcludeWords: string[]
   exportWriteLayout: 'A' | 'B' | 'C'
+  exportAutomationTaskMap: Record<string, unknown>
+
+  // AI 见解
+  aiModelApiBaseUrl: string
+  aiModelApiKey: string
+  aiModelApiModel: string
+  aiInsightEnabled: boolean
+  aiInsightApiBaseUrl: string
+  aiInsightApiKey: string
+  aiInsightApiModel: string
+  aiInsightSilenceDays: number
+  aiInsightAllowContext: boolean
+  aiInsightWhitelistEnabled: boolean
+  aiInsightWhitelist: string[]
+  /** 活跃分析冷却时间（分钟），0 表示无冷却 */
+  aiInsightCooldownMinutes: number
+  /** 沉默联系人扫描间隔（小时） */
+  aiInsightScanIntervalHours: number
+  /** 发送上下文时的最大消息条数 */
+  aiInsightContextCount: number
+  /** 自定义 system prompt，空字符串表示使用内置默认值 */
+  aiInsightSystemPrompt: string
+  /** 是否启用 Telegram 推送 */
+  aiInsightTelegramEnabled: boolean
+  /** Telegram Bot Token */
+  aiInsightTelegramToken: string
+  /** Telegram 接收 Chat ID，逗号分隔，支持多个 */
+  aiInsightTelegramChatIds: string
+
+  // AI 足迹
+  aiFootprintEnabled: boolean
+  aiFootprintSystemPrompt: string
+  /** 是否将 AI 见解调试日志输出到桌面 */
+  aiInsightDebugLogEnabled: boolean
 }
 
 // 需要 safeStorage 加密的字段（普通模式）
-const ENCRYPTED_STRING_KEYS: Set<string> = new Set(['decryptKey', 'imageAesKey', 'authPassword', 'httpApiToken'])
+const ENCRYPTED_STRING_KEYS: Set<string> = new Set([
+  'decryptKey',
+  'imageAesKey',
+  'authPassword',
+  'httpApiToken',
+  'aiModelApiKey',
+  'aiInsightApiKey'
+])
 const ENCRYPTED_BOOL_KEYS: Set<string> = new Set(['authEnabled', 'authUseHello'])
 const ENCRYPTED_NUMBER_KEYS: Set<string> = new Set(['imageXorKey'])
 
@@ -130,12 +180,36 @@ export class ConfigService {
       httpApiToken: '',
       httpApiEnabled: false,
       httpApiPort: 5031,
-      httpApiHost: '0.0.0.0',
+      httpApiHost: '127.0.0.1',
       messagePushEnabled: false,
+      messagePushFilterMode: 'all',
+      messagePushFilterList: [],
       windowCloseBehavior: 'ask',
       quoteLayout: 'quote-top',
       wordCloudExcludeWords: [],
-      exportWriteLayout: 'A'
+      exportWriteLayout: 'A',
+      exportAutomationTaskMap: {},
+      aiModelApiBaseUrl: '',
+      aiModelApiKey: '',
+      aiModelApiModel: 'gpt-4o-mini',
+      aiInsightEnabled: false,
+      aiInsightApiBaseUrl: '',
+      aiInsightApiKey: '',
+      aiInsightApiModel: 'gpt-4o-mini',
+      aiInsightSilenceDays: 3,
+      aiInsightAllowContext: false,
+      aiInsightWhitelistEnabled: false,
+      aiInsightWhitelist: [],
+      aiInsightCooldownMinutes: 120,
+      aiInsightScanIntervalHours: 4,
+      aiInsightContextCount: 40,
+      aiInsightSystemPrompt: '',
+      aiInsightTelegramEnabled: false,
+      aiInsightTelegramToken: '',
+      aiInsightTelegramChatIds: '',
+      aiFootprintEnabled: false,
+      aiFootprintSystemPrompt: '',
+      aiInsightDebugLogEnabled: false
     }
 
     const storeOptions: any = {
@@ -167,6 +241,7 @@ export class ConfigService {
       }
     }
     this.migrateAuthFields()
+    this.migrateAiConfig()
   }
 
   // === 状态查询 ===
@@ -224,7 +299,9 @@ export class ConfigService {
     const inLockMode = this.isLockMode() && this.unlockPassword
 
     if (ENCRYPTED_BOOL_KEYS.has(key)) {
-      toStore = this.safeEncrypt(String(value)) as ConfigSchema[K]
+      const boolValue = value === true || value === 'true'
+      // `false` 不需要写入 keychain，避免无意义触发 macOS 钥匙串弹窗
+      toStore = (boolValue ? this.safeEncrypt('true') : false) as ConfigSchema[K]
     } else if (ENCRYPTED_NUMBER_KEYS.has(key)) {
       if (inLockMode && LOCKABLE_NUMBER_KEYS.has(key)) {
         toStore = this.lockEncrypt(String(value), this.unlockPassword!) as ConfigSchema[K]
@@ -257,7 +334,7 @@ export class ConfigService {
   private safeEncrypt(plaintext: string): string {
     if (!plaintext) return ''
     if (plaintext.startsWith(SAFE_PREFIX)) return plaintext
-    if (!safeStorage.isEncryptionAvailable()) return plaintext
+    if (!isSafeStorageAvailable()) return plaintext
     const encrypted = safeStorage.encryptString(plaintext)
     return SAFE_PREFIX + encrypted.toString('base64')
   }
@@ -265,7 +342,7 @@ export class ConfigService {
   private safeDecrypt(stored: string): string {
     if (!stored) return ''
     if (!stored.startsWith(SAFE_PREFIX)) return stored
-    if (!safeStorage.isEncryptionAvailable()) return ''
+    if (!isSafeStorageAvailable()) return ''
     try {
       const buf = Buffer.from(stored.slice(SAFE_PREFIX.length), 'base64')
       return safeStorage.decryptString(buf)
@@ -603,7 +680,7 @@ export class ConfigService {
 
   clearHelloSecret(): void {
     this.store.set('authHelloSecret', '' as any)
-    this.store.set('authUseHello', this.safeEncrypt('false') as any)
+    this.store.set('authUseHello', false as any)
   }
 
   // === 迁移 ===
@@ -612,13 +689,18 @@ export class ConfigService {
     // 将旧版明文 auth 字段迁移为 safeStorage 加密格式
     // 如果已经是 safe: 或 lock: 前缀则跳过
     const rawEnabled: any = this.store.get('authEnabled')
-    if (typeof rawEnabled === 'boolean') {
-      this.store.set('authEnabled', this.safeEncrypt(String(rawEnabled)) as any)
+    if (rawEnabled === true || rawEnabled === 'true') {
+      this.store.set('authEnabled', this.safeEncrypt('true') as any)
+    } else if (rawEnabled === false || rawEnabled === 'false') {
+      // 保持 false 为明文布尔，避免冷启动访问 keychain
+      this.store.set('authEnabled', false as any)
     }
 
     const rawUseHello: any = this.store.get('authUseHello')
-    if (typeof rawUseHello === 'boolean') {
-      this.store.set('authUseHello', this.safeEncrypt(String(rawUseHello)) as any)
+    if (rawUseHello === true || rawUseHello === 'true') {
+      this.store.set('authUseHello', this.safeEncrypt('true') as any)
+    } else if (rawUseHello === false || rawUseHello === 'false') {
+      this.store.set('authUseHello', false as any)
     }
 
     const rawPassword: any = this.store.get('authPassword')
@@ -661,6 +743,26 @@ export class ConfigService {
       if (changed) {
         this.store.set('wxidConfigs', wxidConfigs)
       }
+    }
+  }
+
+  private migrateAiConfig(): void {
+    const sharedBaseUrl = String(this.get('aiModelApiBaseUrl') || '').trim()
+    const sharedApiKey = String(this.get('aiModelApiKey') || '').trim()
+    const sharedModel = String(this.get('aiModelApiModel') || '').trim()
+
+    const legacyBaseUrl = String(this.get('aiInsightApiBaseUrl') || '').trim()
+    const legacyApiKey = String(this.get('aiInsightApiKey') || '').trim()
+    const legacyModel = String(this.get('aiInsightApiModel') || '').trim()
+
+    if (!sharedBaseUrl && legacyBaseUrl) {
+      this.set('aiModelApiBaseUrl', legacyBaseUrl)
+    }
+    if (!sharedApiKey && legacyApiKey) {
+      this.set('aiModelApiKey', legacyApiKey)
+    }
+    if (!sharedModel && legacyModel) {
+      this.set('aiModelApiModel', legacyModel)
     }
   }
 

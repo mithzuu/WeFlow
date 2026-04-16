@@ -142,6 +142,14 @@ export interface Message {
   _db_path?: string // 内部字段：记录消息所属数据库路径
 }
 
+type ResourceMessageType = 'image' | 'video' | 'voice' | 'file'
+
+interface ResourceMessageItem extends Message {
+  sessionId: string
+  sessionDisplayName?: string
+  resourceType: ResourceMessageType
+}
+
 export interface Contact {
   username: string
   alias: string
@@ -224,6 +232,109 @@ interface SessionDetailExtra {
 
 type SessionDetail = SessionDetailFast & SessionDetailExtra
 
+interface SyntheticUnreadState {
+  readTimestamp: number
+  scannedTimestamp: number
+  latestTimestamp: number
+  unreadCount: number
+  summaryTimestamp?: number
+  summary?: string
+  lastMsgType?: number
+}
+
+interface MyFootprintSummary {
+  private_inbound_people: number
+  private_replied_people: number
+  private_outbound_people: number
+  private_reply_rate: number
+  mention_count: number
+  mention_group_count: number
+}
+
+interface MyFootprintPrivateSession {
+  session_id: string
+  incoming_count: number
+  outgoing_count: number
+  replied: boolean
+  first_incoming_ts: number
+  first_reply_ts: number
+  latest_ts: number
+  anchor_local_id: number
+  anchor_create_time: number
+  displayName?: string
+  avatarUrl?: string
+}
+
+interface MyFootprintPrivateSegment {
+  session_id: string
+  segment_index: number
+  start_ts: number
+  end_ts: number
+  duration_sec: number
+  incoming_count: number
+  outgoing_count: number
+  message_count: number
+  replied: boolean
+  first_incoming_ts: number
+  first_reply_ts: number
+  latest_ts: number
+  anchor_local_id: number
+  anchor_create_time: number
+  displayName?: string
+  avatarUrl?: string
+}
+
+interface MyFootprintMentionItem {
+  session_id: string
+  local_id: number
+  create_time: number
+  sender_username: string
+  message_content: string
+  source: string
+  sessionDisplayName?: string
+  senderDisplayName?: string
+  senderAvatarUrl?: string
+}
+
+interface MyFootprintMentionGroup {
+  session_id: string
+  count: number
+  latest_ts: number
+  displayName?: string
+  avatarUrl?: string
+}
+
+interface MyFootprintDiagnostics {
+  truncated: boolean
+  scanned_dbs: number
+  elapsed_ms: number
+  mention_truncated?: boolean
+  private_truncated?: boolean
+  native_ms?: number
+  source_filter_ms?: number
+  fallback_ms?: number
+  enrich_ms?: number
+  pipeline_ms?: number
+  fallback_used?: boolean
+  private_limit_effective?: number
+  mention_candidate_limit?: number
+  native_mention_candidates?: number
+  source_filtered_mentions?: number
+  private_session_count?: number
+  group_session_count?: number
+  native_passes?: number
+  native_group_chunks?: number
+}
+
+interface MyFootprintData {
+  summary: MyFootprintSummary
+  private_sessions: MyFootprintPrivateSession[]
+  private_segments: MyFootprintPrivateSegment[]
+  mentions: MyFootprintMentionItem[]
+  mention_groups: MyFootprintMentionGroup[]
+  diagnostics: MyFootprintDiagnostics
+}
+
 // 表情包缓存
 const emojiCache: Map<string, string> = new Map()
 const emojiDownloading: Map<string, Promise<string | null>> = new Map()
@@ -277,6 +388,7 @@ class ChatService {
   private readonly messageDbCountSnapshotCacheTtlMs = 8000
   private sessionMessageCountCache = new Map<string, { count: number; updatedAt: number }>()
   private sessionMessageCountHintCache = new Map<string, number>()
+  private syntheticUnreadState = new Map<string, SyntheticUnreadState>()
   private sessionMessageCountBatchCache: {
     dbSignature: string
     sessionIdsKey: string
@@ -315,6 +427,8 @@ class ChatService {
   private contactLabelNameMapCacheAt = 0
   private readonly contactLabelNameMapCacheTtlMs = 10 * 60 * 1000
   private contactsLoadInFlight: { mode: 'lite' | 'full'; promise: Promise<{ success: boolean; contacts?: ContactInfo[]; error?: string }> } | null = null
+  private contactsMemoryCache = new Map<'lite' | 'full', { scope: string; updatedAt: number; contacts: ContactInfo[] }>()
+  private readonly contactsMemoryCacheTtlMs = 3 * 60 * 1000
   private readonly contactDisplayNameCollator = new Intl.Collator('zh-CN')
   private readonly slowGetContactsLogThresholdMs = 1200
 
@@ -502,6 +616,43 @@ class ChatService {
       }
     } catch (e) {
       // 静默失败，不影响主流程
+    }
+  }
+
+  async warmupMessageDbSnapshot(): Promise<{ success: boolean; messageDbCount?: number; mediaDbCount?: number; error?: string }> {
+    try {
+      const connectResult = await this.ensureConnected()
+      if (!connectResult.success) {
+        return { success: false, error: connectResult.error || '数据库未连接' }
+      }
+
+      const [messageSnapshot, mediaResult] = await Promise.all([
+        this.getMessageDbCountSnapshot(true),
+        wcdbService.listMediaDbs()
+      ])
+
+      let messageDbCount = 0
+      if (messageSnapshot.success && Array.isArray(messageSnapshot.dbPaths)) {
+        messageDbCount = messageSnapshot.dbPaths.length
+      }
+
+      let mediaDbCount = 0
+      if (mediaResult.success && Array.isArray(mediaResult.data)) {
+        this.mediaDbsCache = [...mediaResult.data]
+        this.mediaDbsCacheTime = Date.now()
+        mediaDbCount = mediaResult.data.length
+      }
+
+      if (!messageSnapshot.success && !mediaResult.success) {
+        return {
+          success: false,
+          error: messageSnapshot.error || mediaResult.error || '初始化消息库索引失败'
+        }
+      }
+
+      return { success: true, messageDbCount, mediaDbCount }
+    } catch (e) {
+      return { success: false, error: String(e) }
     }
   }
 
@@ -725,6 +876,10 @@ class ChatService {
         }
       }
 
+      await this.addMissingOfficialSessions(sessions, myWxid)
+      await this.applySyntheticUnreadCounts(sessions)
+      sessions.sort((a, b) => Number(b.sortTimestamp || b.lastTimestamp || 0) - Number(a.sortTimestamp || a.lastTimestamp || 0))
+
       // 不等待联系人信息加载，直接返回基础会话列表
       // 前端可以异步调用 enrichSessionsWithContacts 来补充信息
       return { success: true, sessions }
@@ -732,6 +887,242 @@ class ChatService {
       console.error('ChatService: 获取会话列表失败:', e)
       return { success: false, error: String(e) }
     }
+  }
+
+  private async addMissingOfficialSessions(sessions: ChatSession[], myWxid?: string): Promise<void> {
+    const existing = new Set(sessions.map((session) => String(session.username || '').trim()).filter(Boolean))
+    try {
+      const contactResult = await wcdbService.getContactsCompact()
+      if (!contactResult.success || !Array.isArray(contactResult.contacts)) return
+
+      for (const row of contactResult.contacts as Record<string, any>[]) {
+        const username = String(row.username || '').trim()
+        if (!username.startsWith('gh_') || existing.has(username)) continue
+
+        sessions.push({
+          username,
+          type: 0,
+          unreadCount: 0,
+          summary: '查看公众号历史消息',
+          sortTimestamp: 0,
+          lastTimestamp: 0,
+          lastMsgType: 0,
+          displayName: row.remark || row.nick_name || row.alias || username,
+          avatarUrl: undefined,
+          selfWxid: myWxid
+        })
+        existing.add(username)
+      }
+    } catch (error) {
+      console.warn('[ChatService] 补充公众号会话失败:', error)
+    }
+  }
+
+  private shouldUseSyntheticUnread(sessionId: string): boolean {
+    const normalized = String(sessionId || '').trim()
+    return normalized.startsWith('gh_')
+  }
+
+  private async getSessionMessageStatsSnapshot(sessionId: string): Promise<{ total: number; latestTimestamp: number }> {
+    const tableStatsResult = await wcdbService.getMessageTableStats(sessionId)
+    if (!tableStatsResult.success || !Array.isArray(tableStatsResult.tables)) {
+      return { total: 0, latestTimestamp: 0 }
+    }
+
+    let total = 0
+    let latestTimestamp = 0
+    for (const row of tableStatsResult.tables as Record<string, any>[]) {
+      const count = Number(row.count ?? row.message_count ?? row.messageCount ?? 0)
+      if (Number.isFinite(count) && count > 0) {
+        total += Math.floor(count)
+      }
+
+      const latest = Number(
+        row.last_timestamp ??
+        row.lastTimestamp ??
+        row.last_time ??
+        row.lastTime ??
+        row.max_create_time ??
+        row.maxCreateTime ??
+        0
+      )
+      if (Number.isFinite(latest) && latest > latestTimestamp) {
+        latestTimestamp = Math.floor(latest)
+      }
+    }
+
+    return { total, latestTimestamp }
+  }
+
+  private async applySyntheticUnreadCounts(sessions: ChatSession[]): Promise<void> {
+    const candidates = sessions.filter((session) => this.shouldUseSyntheticUnread(session.username))
+    if (candidates.length === 0) return
+
+    for (const session of candidates) {
+      try {
+        const snapshot = await this.getSessionMessageStatsSnapshot(session.username)
+        const latestTimestamp = Math.max(
+          Number(session.lastTimestamp || 0),
+          Number(session.sortTimestamp || 0),
+          snapshot.latestTimestamp
+        )
+        if (latestTimestamp > 0) {
+          session.lastTimestamp = latestTimestamp
+          session.sortTimestamp = Math.max(Number(session.sortTimestamp || 0), latestTimestamp)
+        }
+        if (snapshot.total > 0) {
+          session.messageCountHint = Math.max(Number(session.messageCountHint || 0), snapshot.total)
+          this.sessionMessageCountHintCache.set(session.username, session.messageCountHint)
+        }
+
+        let state = this.syntheticUnreadState.get(session.username)
+        if (!state) {
+          const initialUnread = await this.getInitialSyntheticUnreadState(session.username, latestTimestamp)
+          state = {
+            readTimestamp: latestTimestamp,
+            scannedTimestamp: latestTimestamp,
+            latestTimestamp,
+            unreadCount: initialUnread.count
+          }
+          if (initialUnread.latestMessage) {
+            state.summary = this.getSessionSummaryFromMessage(initialUnread.latestMessage)
+            state.summaryTimestamp = Number(initialUnread.latestMessage.createTime || latestTimestamp)
+            state.lastMsgType = Number(initialUnread.latestMessage.localType || 0)
+          }
+          this.syntheticUnreadState.set(session.username, state)
+        }
+
+        let latestMessageForSummary: Message | undefined
+        if (latestTimestamp > state.scannedTimestamp) {
+          const newMessagesResult = await this.getNewMessages(
+            session.username,
+            Math.max(0, state.scannedTimestamp),
+            1000
+          )
+          if (newMessagesResult.success && Array.isArray(newMessagesResult.messages)) {
+            let nextUnread = state.unreadCount
+            let nextScannedTimestamp = state.scannedTimestamp
+            for (const message of newMessagesResult.messages) {
+              const createTime = Number(message.createTime || 0)
+              if (!Number.isFinite(createTime) || createTime <= state.scannedTimestamp) continue
+              if (message.isSend === 1) continue
+              nextUnread += 1
+              latestMessageForSummary = message
+              if (createTime > nextScannedTimestamp) {
+                nextScannedTimestamp = Math.floor(createTime)
+              }
+            }
+            state.unreadCount = nextUnread
+            state.scannedTimestamp = Math.max(nextScannedTimestamp, latestTimestamp)
+          } else {
+            state.scannedTimestamp = latestTimestamp
+          }
+        }
+
+        state.latestTimestamp = Math.max(state.latestTimestamp, latestTimestamp)
+        if (latestMessageForSummary) {
+          const summary = this.getSessionSummaryFromMessage(latestMessageForSummary)
+          if (summary) {
+            state.summary = summary
+            state.summaryTimestamp = Number(latestMessageForSummary.createTime || latestTimestamp)
+            state.lastMsgType = Number(latestMessageForSummary.localType || 0)
+          }
+        }
+        if (state.summary) {
+          session.summary = state.summary
+          session.lastMsgType = Number(state.lastMsgType || session.lastMsgType || 0)
+        }
+        session.unreadCount = Math.max(Number(session.unreadCount || 0), state.unreadCount)
+      } catch (error) {
+        console.warn(`[ChatService] 合成公众号未读失败: ${session.username}`, error)
+      }
+    }
+  }
+
+  private getSessionSummaryFromMessage(message: Message): string {
+    const cleanOfficialPrefix = (value: string): string => value.replace(/^\s*\[视频号\]\s*/u, '').trim()
+    let summary = ''
+    switch (Number(message.localType || 0)) {
+      case 1:
+        summary = message.parsedContent || message.rawContent || ''
+        break
+      case 3:
+        summary = '[图片]'
+        break
+      case 34:
+        summary = '[语音]'
+        break
+      case 43:
+        summary = '[视频]'
+        break
+      case 47:
+        summary = '[表情]'
+        break
+      case 42:
+        summary = message.cardNickname || '[名片]'
+        break
+      case 48:
+        summary = '[位置]'
+        break
+      case 49:
+        summary = message.linkTitle || message.fileName || message.parsedContent || '[消息]'
+        break
+      default:
+        summary = message.parsedContent || message.rawContent || this.getMessageTypeLabel(Number(message.localType || 0))
+        break
+    }
+    return cleanOfficialPrefix(this.cleanString(summary))
+  }
+
+  private async getInitialSyntheticUnreadState(sessionId: string, latestTimestamp: number): Promise<{
+    count: number
+    latestMessage?: Message
+  }> {
+    const normalizedLatest = Number(latestTimestamp || 0)
+    if (!Number.isFinite(normalizedLatest) || normalizedLatest <= 0) return { count: 0 }
+
+    const nowSeconds = Math.floor(Date.now() / 1000)
+    if (Math.abs(nowSeconds - normalizedLatest) > 10 * 60) {
+      return { count: 0 }
+    }
+
+    const result = await this.getNewMessages(sessionId, Math.max(0, Math.floor(normalizedLatest) - 1), 20)
+    if (!result.success || !Array.isArray(result.messages)) return { count: 0 }
+    const unreadMessages = result.messages.filter((message) => {
+      const createTime = Number(message.createTime || 0)
+      return Number.isFinite(createTime) &&
+        createTime >= normalizedLatest &&
+        message.isSend !== 1
+    })
+    return {
+      count: unreadMessages.length,
+      latestMessage: unreadMessages[unreadMessages.length - 1]
+    }
+  }
+
+  private markSyntheticUnreadRead(sessionId: string, messages: Message[] = []): void {
+    const normalized = String(sessionId || '').trim()
+    if (!this.shouldUseSyntheticUnread(normalized)) return
+
+    let latestTimestamp = 0
+    const state = this.syntheticUnreadState.get(normalized)
+    if (state) latestTimestamp = Math.max(latestTimestamp, state.latestTimestamp, state.scannedTimestamp)
+    for (const message of messages) {
+      const createTime = Number(message.createTime || 0)
+      if (Number.isFinite(createTime) && createTime > latestTimestamp) {
+        latestTimestamp = Math.floor(createTime)
+      }
+    }
+
+    this.syntheticUnreadState.set(normalized, {
+      readTimestamp: latestTimestamp,
+      scannedTimestamp: latestTimestamp,
+      latestTimestamp,
+      unreadCount: 0,
+      summary: state?.summary,
+      summaryTimestamp: state?.summaryTimestamp,
+      lastMsgType: state?.lastMsgType
+    })
   }
 
   async getSessionStatuses(usernames: string[]): Promise<{
@@ -1354,8 +1745,50 @@ class ChatService {
     }
   }
 
+  private getContactsCacheScope(): string {
+    const dbPath = String(this.configService.get('dbPath') || '').trim()
+    const myWxid = String(this.configService.get('myWxid') || '').trim()
+    return `${dbPath}::${myWxid}`
+  }
+
+  private cloneContacts(contacts: ContactInfo[]): ContactInfo[] {
+    return (contacts || []).map((contact) => ({
+      ...contact,
+      labels: Array.isArray(contact.labels) ? [...contact.labels] : contact.labels
+    }))
+  }
+
+  private getContactsFromMemoryCache(mode: 'lite' | 'full', scope: string): ContactInfo[] | null {
+    const cached = this.contactsMemoryCache.get(mode)
+    if (!cached) return null
+    if (cached.scope !== scope) return null
+    if (Date.now() - cached.updatedAt > this.contactsMemoryCacheTtlMs) return null
+    return this.cloneContacts(cached.contacts)
+  }
+
+  private setContactsMemoryCache(mode: 'lite' | 'full', scope: string, contacts: ContactInfo[]): void {
+    this.contactsMemoryCache.set(mode, {
+      scope,
+      updatedAt: Date.now(),
+      contacts: this.cloneContacts(contacts)
+    })
+  }
+
   private async getContactsInternal(options?: GetContactsOptions): Promise<{ success: boolean; contacts?: ContactInfo[]; error?: string }> {
     const isLiteMode = options?.lite === true
+    const mode: 'lite' | 'full' = isLiteMode ? 'lite' : 'full'
+    const cacheScope = this.getContactsCacheScope()
+    const cachedContacts = this.getContactsFromMemoryCache(mode, cacheScope)
+    if (cachedContacts) {
+      return { success: true, contacts: cachedContacts }
+    }
+    if (isLiteMode) {
+      const fullCachedContacts = this.getContactsFromMemoryCache('full', cacheScope)
+      if (fullCachedContacts) {
+        return { success: true, contacts: fullCachedContacts }
+      }
+    }
+
     const startedAt = Date.now()
     const stageDurations: Array<{ stage: string; ms: number }> = []
     const captureStage = (stage: string, stageStartedAt: number) => {
@@ -1478,6 +1911,10 @@ class ChatService {
           .map((item) => `${item.stage}=${item.ms}ms`)
           .join(', ')
         console.warn(`[ChatService] getContacts(${isLiteMode ? 'lite' : 'full'}) 慢查询 total=${totalMs}ms, ${stageSummary}`)
+      }
+      this.setContactsMemoryCache(mode, cacheScope, result)
+      if (!isLiteMode) {
+        this.setContactsMemoryCache('lite', cacheScope, result)
       }
       return { success: true, contacts: result }
     } catch (e) {
@@ -1628,6 +2065,9 @@ class ChatService {
       releaseMessageCursorMutex?.()
 
       this.messageCacheService.set(sessionId, filtered)
+      if (offset === 0 && startTime === 0 && endTime === 0) {
+        this.markSyntheticUnreadRead(sessionId, filtered)
+      }
       console.log(
         `[ChatService] getMessages session=${sessionId} rawRowsConsumed=${rawRowsConsumed} visibleMessagesReturned=${filtered.length} filteredOut=${collected.filteredOut || 0} nextOffset=${state.fetched} hasMore=${hasMore}`
       )
@@ -2878,6 +3318,7 @@ class ChatService {
     this.sessionTablesCache.clear()
     this.messageTableColumnsCache.clear()
     this.messageDbCountSnapshotCache = null
+    this.contactsMemoryCache.clear()
     this.refreshSessionStatsCacheScope(scope)
     this.refreshGroupMyMessageCountCacheScope(scope)
   }
@@ -4229,6 +4670,8 @@ class ChatService {
         case '57':
           // 引用消息，title 就是回复的内容
           return title
+        case '53':
+          return `[接龙] ${title.split(/\r?\n/).map(line => line.trim()).find(Boolean) || title}`
         case '2000':
           return `[转账] ${title}`
         case '2001':
@@ -4258,6 +4701,8 @@ class ChatService {
         return '[链接]'
       case '87':
         return '[群公告]'
+      case '53':
+        return '[接龙]'
       default:
         return '[消息]'
     }
@@ -4486,15 +4931,16 @@ class ChatService {
    */
   private parseQuoteMessage(content: string): { content?: string; sender?: string } {
     try {
+      const normalizedContent = this.decodeHtmlEntities(content || '')
       // 提取 refermsg 部分
-      const referMsgStart = content.indexOf('<refermsg>')
-      const referMsgEnd = content.indexOf('</refermsg>')
+      const referMsgStart = normalizedContent.indexOf('<refermsg>')
+      const referMsgEnd = normalizedContent.indexOf('</refermsg>')
 
       if (referMsgStart === -1 || referMsgEnd === -1) {
         return {}
       }
 
-      const referMsgXml = content.substring(referMsgStart, referMsgEnd + 11)
+      const referMsgXml = normalizedContent.substring(referMsgStart, referMsgEnd + 11)
 
       // 提取发送者名称
       let displayName = this.extractXmlValue(referMsgXml, 'displayname')
@@ -4511,8 +4957,8 @@ class ChatService {
       let displayContent = referContent
       switch (referType) {
         case '1':
-          // 文本消息，清理可能的 wxid
-          displayContent = this.sanitizeQuotedContent(referContent)
+          // 文本消息优先取“部分引用”字段，缺失时再回退到完整 content
+          displayContent = this.extractPreferredQuotedText(referMsgXml)
           break
         case '3':
           displayContent = '[图片]'
@@ -4550,6 +4996,76 @@ class ChatService {
     } catch {
       return {}
     }
+  }
+
+  private extractPreferredQuotedText(referMsgXml: string): string {
+    if (!referMsgXml) return ''
+
+    const sources = [this.decodeHtmlEntities(referMsgXml)]
+    const rawMsgSource = this.extractXmlValue(referMsgXml, 'msgsource')
+    if (rawMsgSource) {
+      const decodedMsgSource = this.decodeHtmlEntities(rawMsgSource)
+      if (decodedMsgSource) {
+        sources.push(decodedMsgSource)
+      }
+    }
+
+    const fullContent = this.sanitizeQuotedContent(this.extractXmlValue(sources[0] || referMsgXml, 'content'))
+    const partialText = this.extractPartialQuotedText(sources[0] || referMsgXml, fullContent)
+    if (partialText) return partialText
+
+    const candidateTags = [
+      'selectedcontent',
+      'selectedtext',
+      'selectcontent',
+      'selecttext',
+      'quotecontent',
+      'quotetext',
+      'partcontent',
+      'parttext',
+      'excerpt',
+      'summary',
+      'preview'
+    ]
+
+    for (const source of sources) {
+      for (const tag of candidateTags) {
+        const value = this.sanitizeQuotedContent(this.extractXmlValue(source, tag))
+        if (value) return value
+      }
+    }
+
+    return fullContent
+  }
+
+  private extractPartialQuotedText(xml: string, fullContent: string): string {
+    if (!xml || !fullContent) return ''
+
+    const startChar = this.extractXmlValue(xml, 'start')
+    const endChar = this.extractXmlValue(xml, 'end')
+    const startIndexRaw = this.extractXmlValue(xml, 'startindex')
+    const endIndexRaw = this.extractXmlValue(xml, 'endindex')
+    const startIndex = Number.parseInt(startIndexRaw, 10)
+    const endIndex = Number.parseInt(endIndexRaw, 10)
+
+    if (startChar && endChar) {
+      const startPos = fullContent.indexOf(startChar)
+      if (startPos !== -1) {
+        const endPos = fullContent.indexOf(endChar, startPos + startChar.length - 1)
+        if (endPos !== -1 && endPos >= startPos) {
+          const sliced = fullContent.slice(startPos, endPos + endChar.length).trim()
+          if (sliced) return sliced
+        }
+      }
+    }
+
+    if (Number.isFinite(startIndex) && Number.isFinite(endIndex) && endIndex >= startIndex) {
+      const chars = Array.from(fullContent)
+      const sliced = chars.slice(startIndex, endIndex + 1).join('').trim()
+      if (sliced) return sliced
+    }
+
+    return ''
   }
 
   /**
@@ -4786,6 +5302,8 @@ class ChatService {
         const quoteInfo = this.parseQuoteMessage(content)
         result.quotedContent = quoteInfo.content
         result.quotedSender = quoteInfo.sender
+      } else if (xmlType === '53') {
+        result.appMsgKind = 'solitaire'
       } else if ((xmlType === '5' || xmlType === '49') && (sourceUsername?.startsWith('gh_') || appName?.includes('公众号') || sourceName)) {
         result.appMsgKind = 'official-link'
       } else if (url) {
@@ -5596,12 +6114,13 @@ class ChatService {
     // 如果是字符串
     if (typeof raw === 'string') {
       if (raw.length === 0) return ''
+      const compactRaw = this.compactEncodedPayload(raw)
 
       // 检查是否是 hex 编码
       // 只有当字符串足够长（超过16字符）且看起来像 hex 时才尝试解码
       // 短字符串（如 "123456" 等纯数字）容易被误判为 hex
-      if (raw.length > 16 && this.looksLikeHex(raw)) {
-        const bytes = Buffer.from(raw, 'hex')
+      if (compactRaw.length > 16 && this.looksLikeHex(compactRaw)) {
+        const bytes = Buffer.from(compactRaw, 'hex')
         if (bytes.length > 0) {
           const result = this.decodeBinaryContent(bytes, raw)
           // 
@@ -5612,9 +6131,9 @@ class ChatService {
       // 检查是否是 base64 编码
       // 只有当字符串足够长（超过16字符）且看起来像 base64 时才尝试解码
       // 短字符串（如 "test", "home" 等）容易被误判为 base64
-      if (raw.length > 16 && this.looksLikeBase64(raw)) {
+      if (compactRaw.length > 16 && this.looksLikeBase64(compactRaw)) {
         try {
-          const bytes = Buffer.from(raw, 'base64')
+          const bytes = Buffer.from(compactRaw, 'base64')
           return this.decodeBinaryContent(bytes, raw)
         } catch { }
       }
@@ -5673,16 +6192,22 @@ class ChatService {
    * 检查是否像 hex 编码
    */
   private looksLikeHex(s: string): boolean {
-    if (s.length % 2 !== 0) return false
-    return /^[0-9a-fA-F]+$/.test(s)
+    const compact = this.compactEncodedPayload(s)
+    if (compact.length % 2 !== 0) return false
+    return /^[0-9a-fA-F]+$/.test(compact)
   }
 
   /**
    * 检查是否像 base64 编码
    */
   private looksLikeBase64(s: string): boolean {
-    if (s.length % 4 !== 0) return false
-    return /^[A-Za-z0-9+/=]+$/.test(s)
+    const compact = this.compactEncodedPayload(s)
+    if (compact.length % 4 !== 0) return false
+    return /^[A-Za-z0-9+/=]+$/.test(compact)
+  }
+
+  private compactEncodedPayload(raw: string): string {
+    return String(raw || '').replace(/\s+/g, '').trim()
   }
 
   private shouldKeepSession(username: string): boolean {
@@ -5946,6 +6471,7 @@ class ChatService {
     if (includeContacts) {
       this.avatarCache.clear()
       this.contactCacheService.clear()
+      this.contactsMemoryCache.clear()
     }
 
     if (includeMessages) {
@@ -7515,6 +8041,152 @@ class ChatService {
     }
   }
 
+  private resolveResourceType(message: Message): ResourceMessageType | null {
+    if (message.localType === 3) return 'image'
+    if (message.localType === 43) return 'video'
+    if (message.localType === 34) return 'voice'
+    if (
+      message.localType === 49 ||
+      message.localType === 34359738417 ||
+      message.localType === 103079215153 ||
+      message.localType === 25769803825
+    ) {
+      if (message.appMsgKind === 'file' || message.xmlType === '6') return 'file'
+      if (message.localType !== 49) return 'file'
+    }
+    return null
+  }
+
+  async getResourceMessages(options?: {
+    sessionId?: string
+    types?: ResourceMessageType[]
+    beginTimestamp?: number
+    endTimestamp?: number
+    limit?: number
+    offset?: number
+  }): Promise<{
+    success: boolean
+    items?: ResourceMessageItem[]
+    total?: number
+    hasMore?: boolean
+    error?: string
+  }> {
+    try {
+      const connectResult = await this.ensureConnected()
+      if (!connectResult.success) {
+        return { success: false, error: connectResult.error || '数据库未连接' }
+      }
+
+      const requestedTypes = Array.isArray(options?.types)
+        ? options.types.filter((type): type is ResourceMessageType => ['image', 'video', 'voice', 'file'].includes(type))
+        : []
+      const typeSet = new Set<ResourceMessageType>(requestedTypes.length > 0 ? requestedTypes : ['image', 'video', 'voice', 'file'])
+
+      const beginTimestamp = Number(options?.beginTimestamp || 0)
+      const endTimestamp = Number(options?.endTimestamp || 0)
+      const offset = Math.max(0, Number(options?.offset || 0))
+      const limitRaw = Number(options?.limit || 0)
+      const limit = Number.isFinite(limitRaw) ? Math.min(2000, Math.max(1, Math.floor(limitRaw || 300))) : 300
+
+      const sessionsResult = await this.getSessions()
+      if (!sessionsResult.success || !Array.isArray(sessionsResult.sessions)) {
+        return { success: false, error: sessionsResult.error || '获取会话失败' }
+      }
+
+      const sessionNameMap = new Map<string, string>()
+      sessionsResult.sessions.forEach((session) => {
+        sessionNameMap.set(session.username, session.displayName || session.username)
+      })
+
+      const requestedSessionId = String(options?.sessionId || '').trim()
+      const sortedSessions = [...sessionsResult.sessions].sort((a, b) => (b.sortTimestamp || 0) - (a.sortTimestamp || 0))
+      const targetSessionIds = requestedSessionId
+        ? [requestedSessionId]
+        : sortedSessions.map((session) => session.username)
+
+      const localTypes: number[] = []
+      if (typeSet.has('image')) localTypes.push(3)
+      if (typeSet.has('video')) localTypes.push(43)
+      if (typeSet.has('voice')) localTypes.push(34)
+      if (typeSet.has('file')) {
+        localTypes.push(49, 34359738417, 103079215153, 25769803825)
+      }
+      const uniqueLocalTypes = Array.from(new Set(localTypes))
+
+      const allItems: ResourceMessageItem[] = []
+      const dedup = new Set<string>()
+      const targetCount = offset + limit
+      const candidateBuffer = Math.max(180, limit)
+      const perTypeFetch = requestedSessionId
+        ? Math.min(2000, Math.max(200, targetCount * 2))
+        : (beginTimestamp > 0 || endTimestamp > 0 ? 140 : 90)
+      const maxSessionScan = requestedSessionId
+        ? 1
+        : (beginTimestamp > 0 || endTimestamp > 0 ? 240 : 80)
+      const scanSessionIds = targetSessionIds.slice(0, maxSessionScan)
+
+      let maybeHasMore = targetSessionIds.length > scanSessionIds.length
+      let stopEarly = false
+
+      for (const sessionId of scanSessionIds) {
+        const batchRows = await Promise.all(
+          uniqueLocalTypes.map((localType) =>
+            wcdbService.getMessagesByType(sessionId, localType, false, perTypeFetch, 0)
+          )
+        )
+        for (const result of batchRows) {
+          if (!result.success || !Array.isArray(result.rows) || result.rows.length === 0) continue
+          if (result.rows.length >= perTypeFetch) maybeHasMore = true
+
+          const mapped = this.mapRowsToMessages(result.rows as Record<string, any>[])
+          for (const message of mapped) {
+            const resourceType = this.resolveResourceType(message)
+            if (!resourceType || !typeSet.has(resourceType)) continue
+            if (beginTimestamp > 0 && message.createTime < beginTimestamp) continue
+            if (endTimestamp > 0 && message.createTime > endTimestamp) continue
+
+            const dedupKey = `${sessionId}:${message.localId}:${message.serverId}:${message.createTime}:${message.localType}`
+            if (dedup.has(dedupKey)) continue
+            dedup.add(dedupKey)
+
+            allItems.push({
+              ...message,
+              sessionId,
+              sessionDisplayName: sessionNameMap.get(sessionId) || sessionId,
+              resourceType
+            })
+          }
+        }
+
+        if (allItems.length >= targetCount + candidateBuffer) {
+          stopEarly = true
+          maybeHasMore = true
+          break
+        }
+      }
+
+      allItems.sort((a, b) => {
+        const timeDiff = (b.createTime || 0) - (a.createTime || 0)
+        if (timeDiff !== 0) return timeDiff
+        return (b.localId || 0) - (a.localId || 0)
+      })
+
+      const total = allItems.length
+      const start = Math.min(offset, total)
+      const end = Math.min(start + limit, total)
+
+      return {
+        success: true,
+        items: allItems.slice(start, end),
+        total,
+        hasMore: end < total || maybeHasMore || stopEarly
+      }
+    } catch (e) {
+      console.error('[ChatService] 获取资源消息失败:', e)
+      return { success: false, error: String(e) }
+    }
+  }
+
   async getMessageDates(sessionId: string): Promise<{ success: boolean; dates?: string[]; error?: string }> {
     try {
       const connectResult = await this.ensureConnected()
@@ -7554,6 +8226,552 @@ class ChatService {
       return { success: true, counts }
     } catch (error) {
       console.error('[ChatService] 获取每日消息数失败:', error)
+      return { success: false, error: String(error) }
+    }
+  }
+
+  async getMyFootprintStats(
+    beginTimestamp: number,
+    endTimestamp: number,
+    options?: {
+      myWxid?: string
+      privateSessionIds?: string[]
+      groupSessionIds?: string[]
+      mentionLimit?: number
+      privateLimit?: number
+      mentionMode?: 'text_at_me' | string
+    }
+  ): Promise<{ success: boolean; data?: MyFootprintData; error?: string }> {
+    try {
+      const connectResult = await this.ensureConnected()
+      if (!connectResult.success) {
+        return { success: false, error: connectResult.error || '数据库未连接' }
+      }
+
+      const begin = this.normalizeTimestampSeconds(beginTimestamp)
+      const end = this.normalizeTimestampSeconds(endTimestamp)
+      const normalizedEnd = begin > 0 && end > 0 && end < begin ? begin : end
+      const mentionLimitRaw = Number(options?.mentionLimit ?? 0)
+      const privateLimitRaw = Number(options?.privateLimit ?? 0)
+      const mentionLimit = Number.isFinite(mentionLimitRaw) && mentionLimitRaw >= 0
+        ? Math.floor(mentionLimitRaw)
+        : 0
+      const privateLimit = Number.isFinite(privateLimitRaw) && privateLimitRaw >= 0
+        ? Math.floor(privateLimitRaw)
+        : 0
+
+      let myWxid = String(options?.myWxid || '').trim()
+      if (!myWxid) {
+        myWxid = String(this.configService.get('myWxid') || '').trim()
+      }
+      if (!myWxid) {
+        return { success: false, error: '未识别当前账号 wxid' }
+      }
+
+      let privateSessionIds = Array.isArray(options?.privateSessionIds)
+        ? options!.privateSessionIds!.map((value) => String(value || '').trim()).filter(Boolean)
+        : []
+      let groupSessionIds = Array.isArray(options?.groupSessionIds)
+        ? options!.groupSessionIds!.map((value) => String(value || '').trim()).filter(Boolean)
+        : []
+      const hasExplicitGroupScope = Array.isArray(options?.groupSessionIds)
+        && options!.groupSessionIds!.some((value) => String(value || '').trim().length > 0)
+
+      if (privateSessionIds.length === 0 && groupSessionIds.length === 0) {
+        const sessionsResult = await wcdbService.getSessions()
+        if (!sessionsResult.success || !Array.isArray(sessionsResult.sessions)) {
+          return { success: false, error: sessionsResult.error || '读取会话列表失败' }
+        }
+        for (const session of sessionsResult.sessions as Array<Record<string, any>>) {
+          const sessionId = String(session.username || session.user_name || '').trim()
+          if (!sessionId) continue
+          const sessionLastTs = this.normalizeTimestampSeconds(
+            Number(session.lastTimestamp || session.sortTimestamp || 0)
+          )
+          if (sessionId.endsWith('@chatroom')) {
+            groupSessionIds.push(sessionId)
+          } else {
+            if (!this.shouldKeepSession(sessionId)) continue
+            if (begin > 0 && sessionLastTs > 0 && sessionLastTs < begin) continue
+            privateSessionIds.push(sessionId)
+          }
+        }
+      }
+
+      privateSessionIds = Array.from(new Set(
+        privateSessionIds
+          .map((value) => String(value || '').trim())
+          .filter((value) => value && !value.endsWith('@chatroom') && this.shouldKeepSession(value))
+      ))
+      groupSessionIds = Array.from(new Set(
+        groupSessionIds
+          .map((value) => String(value || '').trim())
+          .filter((value) => value && value.endsWith('@chatroom'))
+      ))
+      if (!hasExplicitGroupScope) {
+        groupSessionIds = await this.resolveMyFootprintGroupSessionIds(groupSessionIds, begin, normalizedEnd)
+      }
+
+      privateSessionIds = await this.filterMyFootprintPrivateSessions(privateSessionIds)
+
+      let data: MyFootprintData | null = null
+      const effectivePrivateLimit = privateLimit
+      // native 候选上限：0 表示不截断候选，确保前端 source 二次过滤有完整输入
+      const nativeMentionCandidateLimit = 0
+      let nativePasses = 0
+      const candidateLimitUsed = nativeMentionCandidateLimit
+      let nativeGroupChunks = 0
+
+      const runNativePass = async (passOptions: {
+        label: string
+        passPrivateSessionIds: string[]
+        passGroupSessionIds: string[]
+        candidateLimit: number
+        passPrivateLimit: number
+      }): Promise<MyFootprintData> => {
+        nativePasses += 1
+        const nativeResult = await wcdbService.getMyFootprintStats({
+          beginTimestamp: begin,
+          endTimestamp: normalizedEnd,
+          myWxid,
+          privateSessionIds: passOptions.passPrivateSessionIds,
+          groupSessionIds: passOptions.passGroupSessionIds,
+          mentionLimit: passOptions.candidateLimit,
+          privateLimit: passOptions.passPrivateLimit,
+          mentionMode: options?.mentionMode || 'text_at_me'
+        })
+        if (!nativeResult.success || !nativeResult.data) {
+          throw new Error(nativeResult.error || '获取我的足迹统计失败')
+        }
+        const normalized = this.normalizeMyFootprintData(nativeResult.data)
+        return normalized
+      }
+
+      const runGroupPasses = async (targetGroupSessionIds: string[]): Promise<{ raw: MyFootprintData | null; chunks: number }> => {
+        if (!Array.isArray(targetGroupSessionIds) || targetGroupSessionIds.length === 0) {
+          return { raw: null, chunks: 0 }
+        }
+        const singleGroupThresholdRaw = Number(process.env.WEFLOW_MY_FOOTPRINT_SINGLE_GROUP_THRESHOLD || 40)
+        const singleGroupThreshold = Number.isFinite(singleGroupThresholdRaw) && singleGroupThresholdRaw >= 1
+          ? Math.floor(singleGroupThresholdRaw)
+          : 40
+
+        let aggregated: MyFootprintData | null = null
+        let chunks = 0
+        if (targetGroupSessionIds.length <= singleGroupThreshold) {
+          chunks = targetGroupSessionIds.length
+          for (const sessionId of targetGroupSessionIds) {
+            const chunkRaw = await runNativePass({
+              label: `group-single:${sessionId}`,
+              passPrivateSessionIds: [],
+              passGroupSessionIds: [sessionId],
+              candidateLimit: candidateLimitUsed,
+              passPrivateLimit: 0
+            })
+            aggregated = aggregated
+              ? this.mergeMyFootprintMentionResult(aggregated, chunkRaw)
+              : chunkRaw
+          }
+        } else {
+          const groupChunks = splitGroupSessionsForNative(targetGroupSessionIds)
+          chunks = groupChunks.length
+          for (const chunk of groupChunks) {
+            const chunkRaw = await runNativePass({
+              label: `group-chunk:${chunk[0] || ''}..(${chunk.length})`,
+              passPrivateSessionIds: [],
+              passGroupSessionIds: chunk,
+              candidateLimit: candidateLimitUsed,
+              passPrivateLimit: 0
+            })
+            aggregated = aggregated
+              ? this.mergeMyFootprintMentionResult(aggregated, chunkRaw)
+              : chunkRaw
+          }
+        }
+        return { raw: aggregated, chunks }
+      }
+
+      const splitGroupSessionsForNative = (sessionIds: string[]): string[][] => {
+        const normalized = Array.from(new Set(
+          (sessionIds || [])
+            .map((value) => String(value || '').trim())
+            .filter((value) => value.endsWith('@chatroom'))
+        ))
+        if (normalized.length === 0) return []
+
+        // 规避 native options_json 可能存在的固定缓冲上限：按 payload 字节安全分块。
+        // 这不是降级或裁剪范围，而是完整遍历所有群并做结果合并。
+        const maxBytesRaw = Number(process.env.WEFLOW_MY_FOOTPRINT_GROUP_OPTIONS_MAX_BYTES || 900)
+        const maxBytes = Number.isFinite(maxBytesRaw) && maxBytesRaw >= 512
+          ? Math.floor(maxBytesRaw)
+          : 900
+        const estimateBytes = (groups: string[]): number => Buffer.byteLength(JSON.stringify({
+          begin,
+          end: normalizedEnd,
+          my_wxid: myWxid,
+          private_session_ids: [],
+          group_session_ids: groups,
+          mention_limit: candidateLimitUsed,
+          private_limit: 0,
+          mention_mode: options?.mentionMode || 'text_at_me'
+        }), 'utf8')
+
+        const chunks: string[][] = []
+        let current: string[] = []
+        for (const sessionId of normalized) {
+          if (current.length === 0) {
+            current.push(sessionId)
+            continue
+          }
+          const next = [...current, sessionId]
+          if (estimateBytes(next) > maxBytes) {
+            chunks.push(current)
+            current = [sessionId]
+          } else {
+            current = next
+          }
+        }
+        if (current.length > 0) chunks.push(current)
+        return chunks
+      }
+
+      let privateNativeRaw: MyFootprintData | null = null
+      let mentionNativeRaw: MyFootprintData | null = null
+
+      if (privateSessionIds.length > 0) {
+        privateNativeRaw = await runNativePass({
+          label: 'private',
+          passPrivateSessionIds: privateSessionIds,
+          passGroupSessionIds: [],
+          candidateLimit: 0,
+          passPrivateLimit: effectivePrivateLimit
+        })
+      }
+
+      if (groupSessionIds.length > 0) {
+        const firstPass = await runGroupPasses(groupSessionIds)
+        mentionNativeRaw = firstPass.raw
+        nativeGroupChunks = firstPass.chunks
+
+        if ((mentionNativeRaw?.mentions.length || 0) === 0) {
+          const probeIndexes = Array.from(new Set([
+            0,
+            Math.floor(groupSessionIds.length / 2),
+            groupSessionIds.length - 1
+          ])).filter((index) => index >= 0 && index < groupSessionIds.length)
+          let probeHit = false
+          for (const index of probeIndexes) {
+            const sessionId = groupSessionIds[index]
+            const probeRaw = await runNativePass({
+              label: `group-probe:${sessionId}`,
+              passPrivateSessionIds: [],
+              passGroupSessionIds: [sessionId],
+              candidateLimit: candidateLimitUsed,
+              passPrivateLimit: 0
+            })
+            if (probeRaw.mentions.length > 0 || probeRaw.summary.mention_count > 0) {
+              probeHit = true
+              break
+            }
+          }
+
+          if (probeHit) {
+            await wcdbService.getSessions().catch(() => ({ success: false }))
+            const retryPass = await runGroupPasses(groupSessionIds)
+            mentionNativeRaw = retryPass.raw
+            nativeGroupChunks = retryPass.chunks
+          }
+        }
+      }
+
+      let nativeRaw = privateNativeRaw || mentionNativeRaw || this.normalizeMyFootprintData({})
+      if (privateNativeRaw && mentionNativeRaw) {
+        nativeRaw = this.mergeMyFootprintMentionResult(privateNativeRaw, mentionNativeRaw)
+      }
+
+      data = this.filterMyFootprintMentionsBySource(nativeRaw, myWxid, mentionLimit)
+
+      if (privateSessionIds.length > 0 && data.private_segments.length === 0) {
+        const privateSegments = await this.rebuildMyFootprintPrivateSegments({
+          begin,
+          end: normalizedEnd,
+          myWxid,
+          privateSessionIds
+        })
+        if (privateSegments.length > 0) {
+          data = {
+            ...data,
+            private_segments: privateSegments
+          }
+        }
+      }
+
+      if (data.mentions.length === 0) {
+        if (this.shouldRunMyFootprintHeavyDebug()) {
+          const privatePassRawMentions = privateNativeRaw?.mentions.length || 0
+          const mentionPassRawMentions = mentionNativeRaw?.mentions.length || 0
+          console.warn(
+            `[MyFootprint][diag] zero filtered mentions begin=${begin} end=${normalizedEnd} groups=${groupSessionIds.length} raw=${nativeRaw.mentions.length} splitRaw(private=${privatePassRawMentions},group=${mentionPassRawMentions}) passes=${nativePasses} groupChunks=${nativeGroupChunks}`
+          )
+          await this.printMyFootprintNativeLogs('zero_filtered_mentions')
+          await this.logMyFootprintNativeQuickProbe({
+            begin,
+            end: normalizedEnd,
+            myWxid,
+            groupSessionIds,
+            mentionMode: options?.mentionMode || 'text_at_me'
+          })
+          await this.logMyFootprintZeroMentionDebug({
+            begin,
+            end: normalizedEnd,
+            myWxid,
+            groupSessionIds,
+            nativeData: nativeRaw
+          })
+        }
+      }
+
+      const enriched = await this.enrichMyFootprintData(data)
+      return { success: true, data: enriched }
+    } catch (error) {
+      console.error('[ChatService] 获取我的足迹统计失败:', error)
+      return { success: false, error: String(error) }
+    }
+  }
+
+  private async logMyFootprintNativeQuickProbe(params: {
+    begin: number
+    end: number
+    myWxid: string
+    groupSessionIds: string[]
+    mentionMode: string
+  }): Promise<void> {
+    try {
+      const groups = Array.from(new Set(
+        (params.groupSessionIds || [])
+          .map((value) => String(value || '').trim())
+          .filter((value) => value.endsWith('@chatroom'))
+      ))
+      if (groups.length === 0) {
+        console.warn('[MyFootprint][native-quick] skipped: no groups')
+        return
+      }
+      const indices = Array.from(new Set([
+        0,
+        Math.floor(groups.length / 2),
+        groups.length - 1
+      ])).filter((index) => index >= 0 && index < groups.length)
+
+      for (const index of indices) {
+        const sessionId = groups[index]
+        const result = await wcdbService.getMyFootprintStats({
+          beginTimestamp: params.begin,
+          endTimestamp: params.end,
+          myWxid: params.myWxid,
+          privateSessionIds: [],
+          groupSessionIds: [sessionId],
+          mentionLimit: 0,
+          privateLimit: 0,
+          mentionMode: params.mentionMode
+        })
+        if (!result.success || !result.data) {
+          console.warn(
+            `[MyFootprint][native-quick][${index + 1}/${groups.length}][${sessionId}] fail err=${result.error || 'unknown'}`
+          )
+          continue
+        }
+        const raw = this.normalizeMyFootprintData(result.data)
+        console.warn(
+          `[MyFootprint][native-quick][${index + 1}/${groups.length}][${sessionId}] mentions=${raw.mentions.length} mentionGroups=${raw.mention_groups.length} summaryMention=${raw.summary.mention_count} diagScanned=${raw.diagnostics.scanned_dbs} diagElapsed=${raw.diagnostics.elapsed_ms}`
+        )
+      }
+    } catch (error) {
+      console.warn('[MyFootprint][native-quick] exception:', error)
+    }
+  }
+
+  private async rebuildMyFootprintPrivateSegments(params: {
+    begin: number
+    end: number
+    myWxid: string
+    privateSessionIds: string[]
+  }): Promise<MyFootprintPrivateSegment[]> {
+    const sessionGapSeconds = 10 * 60
+    const segments: MyFootprintPrivateSegment[] = []
+
+    type WorkingSegment = {
+      segment_index: number
+      start_ts: number
+      end_ts: number
+      incoming_count: number
+      outgoing_count: number
+      first_incoming_ts: number
+      first_reply_ts: number
+      anchor_local_id: number
+      anchor_create_time: number
+      latest_local_id: number
+      latest_create_time: number
+    }
+
+    for (const sessionId of params.privateSessionIds) {
+      const cursorResult = await wcdbService.openMessageCursorLite(
+        sessionId,
+        360,
+        true,
+        params.begin,
+        params.end
+      )
+      if (!cursorResult.success || !cursorResult.cursor) continue
+
+      let segmentCursor = 0
+      let active: WorkingSegment | null = null
+      let lastMessageTs = 0
+      const commit = () => {
+        if (!active) return
+        const startTs = active.start_ts > 0 ? active.start_ts : active.anchor_create_time
+        const endTs = active.end_ts > 0 ? active.end_ts : startTs
+        const incoming = Math.max(0, active.incoming_count)
+        const outgoing = Math.max(0, active.outgoing_count)
+        const messageCount = incoming + outgoing
+        if (startTs > 0 && messageCount > 0) {
+          segments.push({
+            session_id: sessionId,
+            segment_index: active.segment_index,
+            start_ts: startTs,
+            end_ts: endTs,
+            duration_sec: Math.max(0, endTs - startTs),
+            incoming_count: incoming,
+            outgoing_count: outgoing,
+            message_count: messageCount,
+            replied: incoming > 0 && outgoing > 0,
+            first_incoming_ts: active.first_incoming_ts,
+            first_reply_ts: active.first_reply_ts,
+            latest_ts: endTs,
+            anchor_local_id: active.anchor_local_id,
+            anchor_create_time: startTs
+          })
+        }
+        active = null
+      }
+
+      let hasMore = true
+      try {
+        while (hasMore) {
+          const batchResult = await wcdbService.fetchMessageBatch(cursorResult.cursor)
+          if (!batchResult.success || !Array.isArray(batchResult.rows)) break
+          hasMore = Boolean(batchResult.hasMore)
+
+          for (const row of batchResult.rows as Array<Record<string, any>>) {
+            const createTime = this.toSafeInt(row.create_time, 0)
+            const localId = this.toSafeInt(row.local_id, 0)
+            const isSend = this.resolveFootprintRowIsSend(row, params.myWxid)
+
+            if (createTime > 0) {
+              const needNew = !active || (lastMessageTs > 0 && createTime - lastMessageTs > sessionGapSeconds)
+              if (needNew) {
+                commit()
+                segmentCursor += 1
+                active = {
+                  segment_index: segmentCursor,
+                  start_ts: createTime,
+                  end_ts: createTime,
+                  incoming_count: 0,
+                  outgoing_count: 0,
+                  first_incoming_ts: 0,
+                  first_reply_ts: 0,
+                  anchor_local_id: localId,
+                  anchor_create_time: createTime,
+                  latest_local_id: localId,
+                  latest_create_time: createTime
+                }
+              }
+            } else if (!active) {
+              segmentCursor += 1
+              active = {
+                segment_index: segmentCursor,
+                start_ts: 0,
+                end_ts: 0,
+                incoming_count: 0,
+                outgoing_count: 0,
+                first_incoming_ts: 0,
+                first_reply_ts: 0,
+                anchor_local_id: localId,
+                anchor_create_time: 0,
+                latest_local_id: localId,
+                latest_create_time: 0
+              }
+            }
+
+            if (isSend) {
+              if (active) {
+                active.outgoing_count += 1
+                if (
+                  createTime > 0
+                  && active.first_incoming_ts > 0
+                  && createTime >= active.first_incoming_ts
+                  && active.first_reply_ts <= 0
+                ) {
+                  active.first_reply_ts = createTime
+                }
+              }
+            } else if (active) {
+              active.incoming_count += 1
+              if (active.first_incoming_ts <= 0 || (createTime > 0 && createTime < active.first_incoming_ts)) {
+                active.first_incoming_ts = createTime
+              }
+            }
+
+            if (active && createTime > 0) {
+              active.end_ts = createTime
+              active.latest_create_time = createTime
+              active.latest_local_id = localId
+              lastMessageTs = createTime
+            }
+          }
+        }
+      } finally {
+        await wcdbService.closeMessageCursor(cursorResult.cursor).catch(() => {})
+      }
+
+      commit()
+    }
+
+    return segments.sort((a, b) => {
+      if (a.start_ts !== b.start_ts) return a.start_ts - b.start_ts
+      if (a.session_id !== b.session_id) return a.session_id.localeCompare(b.session_id)
+      return a.segment_index - b.segment_index
+    })
+  }
+
+  async exportMyFootprint(
+    beginTimestamp: number,
+    endTimestamp: number,
+    format: 'csv' | 'json',
+    filePath: string
+  ): Promise<{ success: boolean; filePath?: string; error?: string }> {
+    try {
+      const normalizedFormat = String(format || '').toLowerCase() === 'csv' ? 'csv' : 'json'
+      const targetPath = String(filePath || '').trim()
+      if (!targetPath) {
+        return { success: false, error: '导出路径不能为空' }
+      }
+
+      const statsResult = await this.getMyFootprintStats(beginTimestamp, endTimestamp)
+      if (!statsResult.success || !statsResult.data) {
+        return { success: false, error: statsResult.error || '导出前获取统计失败' }
+      }
+
+      mkdirSync(dirname(targetPath), { recursive: true })
+      if (normalizedFormat === 'json') {
+        writeFileSync(targetPath, JSON.stringify(statsResult.data, null, 2), 'utf-8')
+      } else {
+        const csv = this.buildMyFootprintCsv(statsResult.data)
+        writeFileSync(targetPath, `\uFEFF${csv}`, 'utf-8')
+      }
+
+      return { success: true, filePath: targetPath }
+    } catch (error) {
+      console.error('[ChatService] 导出我的足迹失败:', error)
       return { success: false, error: String(error) }
     }
   }
@@ -7613,6 +8831,1637 @@ class ChatService {
       console.error('ChatService: searchMessages 失败:', e)
       return { success: false, error: String(e) }
     }
+  }
+
+  private normalizeTimestampSeconds(value: number): number {
+    const numeric = Number(value || 0)
+    if (!Number.isFinite(numeric) || numeric <= 0) return 0
+    return numeric > 1e12 ? Math.floor(numeric / 1000) : Math.floor(numeric)
+  }
+
+  private toSafeInt(value: unknown, fallback = 0): number {
+    const parsed = Number.parseInt(String(value ?? '').trim(), 10)
+    return Number.isFinite(parsed) ? parsed : fallback
+  }
+
+  private toSafeNumber(value: unknown, fallback = 0): number {
+    const parsed = Number(value)
+    return Number.isFinite(parsed) ? parsed : fallback
+  }
+
+  private resolveFootprintRowIsSend(row: Record<string, any>, myWxid: string): boolean {
+    const raw = row.computed_is_send ?? row.is_send
+    if (raw === 1 || raw === '1' || raw === true || raw === 'true') return true
+    if (raw === 0 || raw === '0' || raw === false || raw === 'false') return false
+    const senderUsername = String(row.sender_username || row.senderUsername || '').trim()
+    return Boolean(senderUsername && myWxid && senderUsername === myWxid)
+  }
+
+  private splitAtUserList(raw: string): string[] {
+    const tokens = String(raw || '')
+      .split(/[,\s;|]+/g)
+      .map((token) => token.trim().replace(/^@+/, '').replace(/^["']+|["']+$/g, ''))
+      .filter(Boolean)
+    return Array.from(new Set(tokens))
+  }
+
+  private containsAtSign(text: string): boolean {
+    if (!text) return false
+    return text.includes('@') || text.includes('＠')
+  }
+
+  private footprintMessageLikelyContainsAt(rawContent: unknown): boolean {
+    if (rawContent === null || rawContent === undefined) return false
+    const text = typeof rawContent === 'string' ? rawContent : String(rawContent || '')
+    return this.containsAtSign(text)
+  }
+
+  private matchesMyFootprintIdentity(rawToken: string, identitySet: Set<string>): boolean {
+    const token = String(rawToken || '').trim().replace(/^@+/, '')
+    if (!token) return false
+
+    const normalizedCandidates = new Set<string>()
+    const addCandidate = (value: string) => {
+      const normalized = String(value || '').trim().toLowerCase()
+      if (!normalized) return
+      normalizedCandidates.add(normalized)
+    }
+
+    addCandidate(token)
+    addCandidate(token.replace(/@chatroom$/i, ''))
+    addCandidate(token.replace(/@openim$/i, ''))
+
+    for (const candidate of normalizedCandidates) {
+      if (!candidate) continue
+      for (const selfId of identitySet) {
+        if (!selfId) continue
+        if (candidate === selfId) return true
+        if (candidate.startsWith(`${selfId}_`) || selfId.startsWith(`${candidate}_`)) return true
+      }
+    }
+    return false
+  }
+
+  private buildMyFootprintIdentitySet(myWxid: string): Set<string> {
+    const set = new Set<string>()
+    const add = (value: string) => {
+      const normalized = String(value || '').trim().toLowerCase()
+      if (!normalized) return
+      set.add(normalized)
+    }
+
+    const raw = String(myWxid || '').trim()
+    add(raw)
+    add(this.cleanAccountDirName(raw))
+    for (const key of this.buildIdentityKeys(raw)) {
+      add(key)
+    }
+    return set
+  }
+
+  private buildFootprintSourceCandidates(source: unknown): string[] {
+    const sourceCandidates: string[] = []
+    const seen = new Set<string>()
+    const pushCandidate = (value: unknown) => {
+      const normalized = this.cleanUtf16(String(value || '').trim())
+      if (!normalized) return
+      if (seen.has(normalized)) return
+      seen.add(normalized)
+      sourceCandidates.push(normalized)
+    }
+
+    const rawSource = typeof source === 'string'
+      ? source
+      : Buffer.isBuffer(source) || source instanceof Uint8Array
+        ? Buffer.from(source).toString('utf-8')
+        : typeof source === 'object' && source !== null && Array.isArray((source as { data?: unknown }).data)
+          ? Buffer.from((source as { data: number[] }).data).toString('utf-8')
+          : String(source || '')
+    const normalizedSource = String(rawSource || '').trim()
+    pushCandidate(normalizedSource)
+    if (normalizedSource.includes('&')) {
+      pushCandidate(this.decodeHtmlEntities(normalizedSource))
+    }
+
+    const sourceLooksEncoded = normalizedSource.length > 16
+      && (this.looksLikeHex(normalizedSource) || this.looksLikeBase64(normalizedSource))
+    if (sourceLooksEncoded) {
+      const decodedFromText = this.decodeMaybeCompressed(normalizedSource, 'footprint_source')
+      pushCandidate(decodedFromText)
+      if (decodedFromText.includes('&')) {
+        pushCandidate(this.decodeHtmlEntities(decodedFromText))
+      }
+    } else if (typeof source !== 'string') {
+      const decodedFromBinary = this.decodeMaybeCompressed(source, 'footprint_source')
+      pushCandidate(decodedFromBinary)
+      if (decodedFromBinary.includes('&')) {
+        pushCandidate(this.decodeHtmlEntities(decodedFromBinary))
+      }
+    }
+
+    return sourceCandidates
+  }
+
+  private normalizeFootprintSourceForOutput(source: unknown): string {
+    if (source === null || source === undefined) return ''
+    if (typeof source === 'string') return source.trim()
+    if (Buffer.isBuffer(source) || source instanceof Uint8Array) {
+      return this.decodeBinaryContent(Buffer.from(source), '').trim()
+    }
+    if (typeof source === 'object' && source !== null && Array.isArray((source as { data?: unknown }).data)) {
+      return this.decodeBinaryContent(Buffer.from((source as { data: number[] }).data), '').trim()
+    }
+    return String(source || '').trim()
+  }
+
+  private extractAtUserListTokensFromSource(source: unknown, prebuiltCandidates?: string[]): string[] {
+    const tokens = new Set<string>()
+    const sourceCandidates = Array.isArray(prebuiltCandidates) && prebuiltCandidates.length > 0
+      ? prebuiltCandidates
+      : this.buildFootprintSourceCandidates(source)
+    const addTokens = (values: string[]) => {
+      for (const value of values) {
+        const normalized = String(value || '').trim()
+        if (!normalized) continue
+        tokens.add(normalized)
+      }
+    }
+
+    const xmlPattern = /<atuserlist[^>]*>([\s\S]*?)<\/atuserlist>/gi
+    const cdataPattern = /<!\[CDATA\[([\s\S]*?)\]\]>/i
+    for (const candidateSource of sourceCandidates) {
+      if (!candidateSource.toLowerCase().includes('atuserlist')) continue
+
+      const trimmedCandidateSource = candidateSource.trim()
+      const maybeJson = trimmedCandidateSource.startsWith('{')
+        || trimmedCandidateSource.startsWith('[')
+        || trimmedCandidateSource.includes('"atuserlist"')
+      if (maybeJson) {
+        try {
+          const parsed = JSON.parse(candidateSource)
+          const atUserList = parsed?.atuserlist
+          if (Array.isArray(atUserList)) {
+            const values = atUserList
+              .map((item: unknown) => this.splitAtUserList(String(item || '')))
+              .flat()
+            addTokens(values)
+          }
+          if (typeof atUserList === 'string') {
+            addTokens(this.splitAtUserList(atUserList))
+          }
+        } catch {
+          // ignore JSON parse error and continue fallback parsing
+        }
+      }
+
+      const jsonMatch = candidateSource.match(/"atuserlist"\s*:\s*(\[[^\]]*\]|"[^"]*"|'[^']*'|[^,}\s]+)/i)
+      if (jsonMatch) {
+        const jsonCandidate = String(jsonMatch[1] || '').trim()
+        if (jsonCandidate.startsWith('[')) {
+          try {
+            const arr = JSON.parse(jsonCandidate)
+            if (Array.isArray(arr)) {
+              const values = arr
+                .map((item) => this.splitAtUserList(String(item || '')))
+                .flat()
+              addTokens(values)
+            }
+          } catch {
+            // ignore array parse error
+          }
+        }
+        const unquoted = jsonCandidate.replace(/^["']+|["']+$/g, '')
+        addTokens(this.splitAtUserList(unquoted))
+      }
+
+      xmlPattern.lastIndex = 0
+      let xmlMatch: RegExpExecArray | null
+      while ((xmlMatch = xmlPattern.exec(candidateSource)) !== null) {
+        let xmlValue = String(xmlMatch[1] || '')
+        const cdataMatch = xmlValue.match(cdataPattern)
+        if (cdataMatch?.[1]) {
+          xmlValue = cdataMatch[1]
+        }
+        addTokens(this.splitAtUserList(xmlValue))
+      }
+    }
+
+    return Array.from(tokens)
+  }
+
+  private sourceAtUserListContains(source: unknown, myWxid: string): boolean {
+    const selfIdentitySet = this.buildMyFootprintIdentitySet(myWxid)
+    return this.sourceAtUserListContainsWithIdentitySet(source, selfIdentitySet)
+  }
+
+  private sourceAtUserListContainsWithIdentitySet(source: unknown, selfIdentitySet: Set<string>): boolean {
+    if (selfIdentitySet.size === 0) return false
+    if (typeof source === 'string') {
+      const raw = source.trim()
+      if (!raw) return false
+      const loweredRaw = raw.toLowerCase()
+      if (loweredRaw.includes('atuserlist')) {
+        for (const identity of selfIdentitySet) {
+          if (identity && loweredRaw.includes(identity)) {
+            return true
+          }
+        }
+        const quickXmlMatch = raw.match(/<atuserlist[^>]*>([\s\S]*?)<\/atuserlist>/i)
+        if (quickXmlMatch?.[1]) {
+          const inner = quickXmlMatch[1]
+          const cdata = inner.match(/<!\[CDATA\[([\s\S]*?)\]\]>/i)?.[1] || inner
+          const quickTokens = this.splitAtUserList(cdata)
+          if (quickTokens.some((token) => this.matchesMyFootprintIdentity(token, selfIdentitySet))) {
+            return true
+          }
+        }
+      } else if (raw.length <= 16 || (!this.looksLikeHex(raw) && !this.looksLikeBase64(raw))) {
+        return false
+      }
+    }
+    const sourceCandidates = this.buildFootprintSourceCandidates(source)
+    for (const candidate of sourceCandidates) {
+      const normalized = String(candidate || '').toLowerCase()
+      if (!normalized || !normalized.includes('atuserlist')) continue
+      for (const identity of selfIdentitySet) {
+        if (identity && normalized.includes(identity)) {
+          return true
+        }
+      }
+    }
+    const tokens = this.extractAtUserListTokensFromSource(source, sourceCandidates)
+    if (tokens.length === 0) return false
+    return tokens.some((token) => this.matchesMyFootprintIdentity(token, selfIdentitySet))
+  }
+
+  private async resolveMyFootprintGroupSessionIds(
+    groupSessionIds: string[],
+    beginTimestamp = 0,
+    endTimestamp = 0
+  ): Promise<string[]> {
+    const normalized = Array.from(new Set(
+      (groupSessionIds || [])
+        .map((value) => String(value || '').trim())
+        .filter((value) => value.endsWith('@chatroom'))
+    ))
+    const begin = this.normalizeTimestampSeconds(beginTimestamp)
+    const end = this.normalizeTimestampSeconds(endTimestamp)
+    void begin
+    void end
+
+    const merged: string[] = []
+    const seen = new Set<string>()
+    const sessionLastTsMap = new Map<string, number>()
+    const hasSessionRank = new Set<string>()
+    const shouldKeepByLastTs = (sessionId: string, preferKeepUnknown: boolean): boolean => {
+      const normalizedSessionId = String(sessionId || '').trim()
+      if (!normalizedSessionId) return false
+      const lastTs = this.normalizeTimestampSeconds(sessionLastTsMap.get(normalizedSessionId) || 0)
+      const known = hasSessionRank.has(normalizedSessionId)
+      if (!known) return preferKeepUnknown || begin <= 0
+      if (begin > 0 && lastTs > 0 && lastTs < begin) return false
+      return true
+    }
+    const push = (value: string) => {
+      const normalizedValue = String(value || '').trim()
+      if (!normalizedValue || !normalizedValue.endsWith('@chatroom')) return
+      if (seen.has(normalizedValue)) return
+      seen.add(normalizedValue)
+      merged.push(normalizedValue)
+    }
+
+    try {
+      const sessionsResult = await this.getSessions()
+      if (sessionsResult.success && Array.isArray(sessionsResult.sessions)) {
+        const rankedGroups = sessionsResult.sessions
+          .map((session) => {
+            const sessionId = String(session?.username || '').trim()
+            const lastTs = this.normalizeTimestampSeconds(
+              Number(session?.lastTimestamp || session?.sortTimestamp || 0)
+            )
+            if (sessionId.endsWith('@chatroom')) {
+              hasSessionRank.add(sessionId)
+              sessionLastTsMap.set(sessionId, lastTs)
+            }
+            return { sessionId, lastTs }
+          })
+          .filter((item) => item.sessionId.endsWith('@chatroom'))
+          .filter((item) => shouldKeepByLastTs(item.sessionId, false))
+          .sort((a, b) => {
+            if (a.lastTs !== b.lastTs) return b.lastTs - a.lastTs
+            return a.sessionId.localeCompare(b.sessionId)
+          })
+        for (const item of rankedGroups) {
+          push(item.sessionId)
+        }
+      }
+    } catch {
+      // ignore session-based scope resolution failure
+    }
+
+    try {
+      const contactGroups = await this.listMyFootprintGroupSessionIdsFromContact()
+      for (const sessionId of contactGroups) {
+        if (!shouldKeepByLastTs(sessionId, false)) continue
+        push(sessionId)
+      }
+    } catch {
+      // ignore contact-based scope resolution failure
+    }
+
+    for (const sessionId of normalized) {
+      if (!shouldKeepByLastTs(sessionId, true)) continue
+      push(sessionId)
+    }
+
+    return merged.length > 0 ? merged : normalized
+  }
+
+  private async listMyFootprintGroupSessionIdsFromContact(): Promise<string[]> {
+    try {
+      const result = await wcdbService.execQuery(
+        'contact',
+        null,
+        "SELECT username FROM contact WHERE username IS NOT NULL AND username != '' AND username LIKE '%@chatroom'"
+      )
+      if (!result.success || !Array.isArray(result.rows)) {
+        return []
+      }
+
+      return Array.from(new Set(
+        (result.rows as Array<Record<string, any>>)
+          .map((row) => String(this.getRowField(row, ['username', 'user_name', 'userName']) || '').trim())
+          .filter((value) => value.endsWith('@chatroom'))
+      ))
+    } catch {
+      return []
+    }
+  }
+
+  private async filterMyFootprintPrivateSessions(privateSessionIds: string[]): Promise<string[]> {
+    const normalized = Array.from(new Set(
+      (privateSessionIds || [])
+        .map((value) => String(value || '').trim())
+        .filter((value) => value && !value.endsWith('@chatroom'))
+    ))
+    if (normalized.length === 0) return normalized
+
+    try {
+      const officialSessionIds = await this.getMyFootprintOfficialSessionIdSet(normalized)
+      if (officialSessionIds.size === 0) return normalized
+      return normalized.filter((sessionId) => !officialSessionIds.has(sessionId))
+    } catch {
+      return normalized
+    }
+  }
+
+  private async getMyFootprintOfficialSessionIdSet(privateSessionIds: string[]): Promise<Set<string>> {
+    const officialSessionIds = new Set<string>()
+    const normalized = Array.from(new Set(
+      (privateSessionIds || [])
+        .map((value) => String(value || '').trim())
+        .filter((value) => value && !value.endsWith('@chatroom'))
+    ))
+    if (normalized.length === 0) return officialSessionIds
+
+    for (const sessionId of normalized) {
+      if (sessionId.startsWith('gh_')) {
+        officialSessionIds.add(sessionId)
+      }
+    }
+
+    const chunkSize = 320
+    const buildInListSql = (values: string[]) => values
+      .map((value) => `'${this.escapeSqlString(value)}'`)
+      .join(',')
+
+    try {
+      const bizInfoTableResult = await wcdbService.execQuery(
+        'contact',
+        null,
+        "SELECT name FROM sqlite_master WHERE type='table' AND lower(name)='biz_info' LIMIT 1"
+      )
+      const bizInfoTableName = bizInfoTableResult.success && Array.isArray(bizInfoTableResult.rows)
+        ? String((bizInfoTableResult.rows[0] as Record<string, any> | undefined)?.name || '').trim()
+        : ''
+      if (bizInfoTableName) {
+        const tableSqlName = this.quoteSqlIdentifier(bizInfoTableName)
+        for (let index = 0; index < normalized.length; index += chunkSize) {
+          const batch = normalized.slice(index, index + chunkSize)
+          if (batch.length === 0) continue
+          const inListSql = buildInListSql(batch)
+          const sql = `SELECT username FROM ${tableSqlName} WHERE username IN (${inListSql})`
+          const result = await wcdbService.execQuery('contact', null, sql)
+          if (!result.success || !Array.isArray(result.rows)) continue
+          for (const row of result.rows as Array<Record<string, any>>) {
+            const username = String(this.getRowField(row, ['username', 'user_name', 'userName']) || '').trim()
+            if (username) officialSessionIds.add(username)
+          }
+        }
+      }
+    } catch {
+      // ignore biz_info lookup failure
+    }
+
+    try {
+      const tableInfo = await wcdbService.execQuery('contact', null, 'PRAGMA table_info(contact)')
+      if (tableInfo.success && Array.isArray(tableInfo.rows)) {
+        const availableColumns = new Map<string, string>()
+        for (const row of tableInfo.rows as Array<Record<string, any>>) {
+          const rawName = row.name ?? row.column_name ?? row.columnName
+          const name = String(rawName || '').trim()
+          if (!name) continue
+          availableColumns.set(name.toLowerCase(), name)
+        }
+
+        const pickColumn = (candidates: string[]): string | null => {
+          for (const candidate of candidates) {
+            const actual = availableColumns.get(candidate.toLowerCase())
+            if (actual) return actual
+          }
+          return null
+        }
+
+        const usernameColumn = pickColumn(['username', 'user_name', 'userName'])
+        const officialFlagColumns = [
+          pickColumn(['verify_flag', 'verifyFlag', 'verifyflag']),
+          pickColumn(['verify_status', 'verifyStatus']),
+          pickColumn(['verify_type', 'verifyType']),
+          pickColumn(['biz_type', 'bizType']),
+          pickColumn(['brand_flag', 'brandFlag']),
+          pickColumn(['service_type', 'serviceType'])
+        ].filter((column): column is string => Boolean(column))
+
+        if (usernameColumn && officialFlagColumns.length > 0) {
+          const selectColumns = Array.from(new Set([usernameColumn, ...officialFlagColumns]))
+          const selectSql = selectColumns.map((column) => this.quoteSqlIdentifier(column)).join(', ')
+          for (let index = 0; index < normalized.length; index += chunkSize) {
+            const batch = normalized.slice(index, index + chunkSize)
+            if (batch.length === 0) continue
+            const inListSql = buildInListSql(batch)
+            const sql = `SELECT ${selectSql} FROM contact WHERE ${this.quoteSqlIdentifier(usernameColumn)} IN (${inListSql})`
+            const result = await wcdbService.execQuery('contact', null, sql)
+            if (!result.success || !Array.isArray(result.rows)) continue
+            for (const row of result.rows as Array<Record<string, any>>) {
+              const username = String(this.getRowField(row, [usernameColumn, 'username', 'user_name', 'userName']) || '').trim()
+              if (!username) continue
+              const hasOfficialFlag = officialFlagColumns.some((column) => (
+                this.isTruthyMyFootprintOfficialFlag(this.getRowField(row, [column]))
+              ))
+              if (hasOfficialFlag) {
+                officialSessionIds.add(username)
+              }
+            }
+          }
+        }
+      }
+    } catch {
+      // ignore contact-flag lookup failure
+    }
+
+    return officialSessionIds
+  }
+
+  private isTruthyMyFootprintOfficialFlag(value: unknown): boolean {
+    if (value === null || value === undefined) return false
+    if (typeof value === 'boolean') return value
+    if (typeof value === 'number') return Number.isFinite(value) && value > 0
+
+    const normalized = String(value || '').trim().toLowerCase()
+    if (!normalized) return false
+    if (normalized === '0' || normalized === 'false' || normalized === 'null' || normalized === 'undefined') {
+      return false
+    }
+
+    const numeric = Number(normalized)
+    if (Number.isFinite(numeric)) {
+      return numeric > 0
+    }
+    return true
+  }
+
+  private normalizeMyFootprintData(raw: any): MyFootprintData {
+    const summaryRaw = raw?.summary || {}
+    const privateSessionsRaw = Array.isArray(raw?.private_sessions) ? raw.private_sessions : []
+    const privateSegmentsRaw = Array.isArray(raw?.private_segments) ? raw.private_segments : []
+    const mentionsRaw = Array.isArray(raw?.mentions) ? raw.mentions : []
+    const mentionGroupsRaw = Array.isArray(raw?.mention_groups) ? raw.mention_groups : []
+    const diagnosticsRaw = raw?.diagnostics || {}
+
+    const summary: MyFootprintSummary = {
+      private_inbound_people: this.toSafeInt(summaryRaw.private_inbound_people, 0),
+      private_replied_people: this.toSafeInt(summaryRaw.private_replied_people, 0),
+      private_outbound_people: this.toSafeInt(summaryRaw.private_outbound_people, 0),
+      private_reply_rate: this.toSafeNumber(summaryRaw.private_reply_rate, 0),
+      mention_count: this.toSafeInt(summaryRaw.mention_count, 0),
+      mention_group_count: this.toSafeInt(summaryRaw.mention_group_count, 0)
+    }
+
+    const private_sessions: MyFootprintPrivateSession[] = privateSessionsRaw.map((item: any) => ({
+      session_id: String(item?.session_id || '').trim(),
+      incoming_count: this.toSafeInt(item?.incoming_count, 0),
+      outgoing_count: this.toSafeInt(item?.outgoing_count, 0),
+      replied: Boolean(item?.replied),
+      first_incoming_ts: this.toSafeInt(item?.first_incoming_ts, 0),
+      first_reply_ts: this.toSafeInt(item?.first_reply_ts, 0),
+      latest_ts: this.toSafeInt(item?.latest_ts, 0),
+      anchor_local_id: this.toSafeInt(item?.anchor_local_id, 0),
+      anchor_create_time: this.toSafeInt(item?.anchor_create_time, 0)
+    })).filter((item) => item.session_id)
+
+    const private_segments: MyFootprintPrivateSegment[] = privateSegmentsRaw.map((item: any) => ({
+      session_id: String(item?.session_id || '').trim(),
+      segment_index: this.toSafeInt(item?.segment_index, 0),
+      start_ts: this.toSafeInt(item?.start_ts, 0),
+      end_ts: this.toSafeInt(item?.end_ts, 0),
+      duration_sec: this.toSafeInt(item?.duration_sec, 0),
+      incoming_count: this.toSafeInt(item?.incoming_count, 0),
+      outgoing_count: this.toSafeInt(item?.outgoing_count, 0),
+      message_count: this.toSafeInt(item?.message_count, 0),
+      replied: Boolean(item?.replied),
+      first_incoming_ts: this.toSafeInt(item?.first_incoming_ts, 0),
+      first_reply_ts: this.toSafeInt(item?.first_reply_ts, 0),
+      latest_ts: this.toSafeInt(item?.latest_ts, 0),
+      anchor_local_id: this.toSafeInt(item?.anchor_local_id, 0),
+      anchor_create_time: this.toSafeInt(item?.anchor_create_time, 0),
+      displayName: String(item?.displayName || '').trim() || undefined,
+      avatarUrl: String(item?.avatarUrl || '').trim() || undefined
+    })).filter((item) => item.session_id && item.start_ts > 0)
+
+    const mentions: MyFootprintMentionItem[] = mentionsRaw.map((item: any) => ({
+      session_id: String(item?.session_id || '').trim(),
+      local_id: this.toSafeInt(item?.local_id, 0),
+      create_time: this.toSafeInt(item?.create_time, 0),
+      sender_username: String(item?.sender_username || '').trim(),
+      message_content: String(item?.message_content || ''),
+      source: String(item?.source || '')
+    })).filter((item) => item.session_id)
+
+    const mention_groups: MyFootprintMentionGroup[] = mentionGroupsRaw.map((item: any) => ({
+      session_id: String(item?.session_id || '').trim(),
+      count: this.toSafeInt(item?.count, 0),
+      latest_ts: this.toSafeInt(item?.latest_ts, 0)
+    })).filter((item) => item.session_id)
+
+    const diagnostics: MyFootprintDiagnostics = {
+      truncated: Boolean(diagnosticsRaw.truncated),
+      scanned_dbs: this.toSafeInt(diagnosticsRaw.scanned_dbs, 0),
+      elapsed_ms: this.toSafeInt(diagnosticsRaw.elapsed_ms, 0),
+      mention_truncated: Boolean(diagnosticsRaw.mention_truncated),
+      private_truncated: Boolean(diagnosticsRaw.private_truncated)
+    }
+
+    return {
+      summary,
+      private_sessions,
+      private_segments,
+      mentions,
+      mention_groups,
+      diagnostics
+    }
+  }
+
+  private filterMyFootprintMentionsBySource(data: MyFootprintData, myWxid: string, mentionLimit: number): MyFootprintData {
+    const identitySet = this.buildMyFootprintIdentitySet(myWxid)
+    if (identitySet.size === 0) {
+      return {
+        ...data,
+        summary: {
+          ...data.summary,
+          mention_count: 0,
+          mention_group_count: 0
+        },
+        mentions: [],
+        mention_groups: []
+      }
+    }
+
+    const sourceMatchCache = new Map<string, boolean>()
+    const filteredMentions = data.mentions.filter((item) => {
+      const sourceKey = String(item.source || '')
+      const cachedMatched = sourceMatchCache.get(sourceKey)
+      if (cachedMatched !== undefined) return cachedMatched
+      const matched = this.sourceAtUserListContainsWithIdentitySet(item.source, identitySet)
+      if (sourceMatchCache.size < 4096) {
+        sourceMatchCache.set(sourceKey, matched)
+      }
+      return matched
+    })
+      .sort((a, b) => {
+        if (b.create_time !== a.create_time) return b.create_time - a.create_time
+        return b.local_id - a.local_id
+      })
+
+    let truncatedByFrontendLimit = false
+    if (mentionLimit > 0 && filteredMentions.length > mentionLimit) {
+      filteredMentions.length = mentionLimit
+      truncatedByFrontendLimit = true
+    }
+
+    const mentionGroupMap = new Map<string, MyFootprintMentionGroup>()
+    for (const mention of filteredMentions) {
+      const group = mentionGroupMap.get(mention.session_id) || {
+        session_id: mention.session_id,
+        count: 0,
+        latest_ts: 0
+      }
+      group.count += 1
+      if (mention.create_time > group.latest_ts) group.latest_ts = mention.create_time
+      mentionGroupMap.set(mention.session_id, group)
+    }
+
+    const filteredMentionGroups = Array.from(mentionGroupMap.values())
+      .sort((a, b) => {
+        if (b.count !== a.count) return b.count - a.count
+        if (b.latest_ts !== a.latest_ts) return b.latest_ts - a.latest_ts
+        return a.session_id.localeCompare(b.session_id)
+      })
+
+    const nextSummary: MyFootprintSummary = {
+      ...data.summary,
+      mention_count: filteredMentions.length,
+      mention_group_count: filteredMentionGroups.length
+    }
+
+    return {
+      ...data,
+      summary: nextSummary,
+      mentions: filteredMentions,
+      mention_groups: filteredMentionGroups,
+      diagnostics: {
+        ...data.diagnostics,
+        truncated: Boolean(data.diagnostics.truncated || truncatedByFrontendLimit)
+      }
+    }
+  }
+
+  private mergeMyFootprintMentionResult(base: MyFootprintData, mentionResult: MyFootprintData): MyFootprintData {
+    const mentionMap = new Map<string, MyFootprintMentionItem>()
+    const pushMention = (item: MyFootprintMentionItem) => {
+      const key = `${item.session_id}#${item.local_id}#${item.create_time}`
+      mentionMap.set(key, item)
+    }
+    for (const item of base.mentions) pushMention(item)
+    for (const item of mentionResult.mentions) pushMention(item)
+
+    const mergedMentions = Array.from(mentionMap.values())
+      .sort((a, b) => {
+        if (b.create_time !== a.create_time) return b.create_time - a.create_time
+        return b.local_id - a.local_id
+      })
+
+    const mentionGroupMetaMap = new Map<string, Pick<MyFootprintMentionGroup, 'displayName' | 'avatarUrl'>>()
+    const pushGroupMeta = (group: MyFootprintMentionGroup) => {
+      const prev = mentionGroupMetaMap.get(group.session_id) || {}
+      mentionGroupMetaMap.set(group.session_id, {
+        displayName: group.displayName || prev.displayName,
+        avatarUrl: group.avatarUrl || prev.avatarUrl
+      })
+    }
+    for (const group of base.mention_groups) pushGroupMeta(group)
+    for (const group of mentionResult.mention_groups) pushGroupMeta(group)
+
+    const mentionGroupMap = new Map<string, MyFootprintMentionGroup>()
+    for (const mention of mergedMentions) {
+      const current = mentionGroupMap.get(mention.session_id) || {
+        session_id: mention.session_id,
+        count: 0,
+        latest_ts: 0
+      }
+      current.count += 1
+      if (mention.create_time > current.latest_ts) {
+        current.latest_ts = mention.create_time
+      }
+      mentionGroupMap.set(mention.session_id, current)
+    }
+
+    const mergedMentionGroups = Array.from(mentionGroupMap.values())
+      .map((group) => {
+        const meta = mentionGroupMetaMap.get(group.session_id)
+        return {
+          ...group,
+          displayName: meta?.displayName,
+          avatarUrl: meta?.avatarUrl
+        }
+      })
+      .sort((a, b) => {
+        if (b.count !== a.count) return b.count - a.count
+        if (b.latest_ts !== a.latest_ts) return b.latest_ts - a.latest_ts
+        return a.session_id.localeCompare(b.session_id)
+      })
+
+    return {
+      ...base,
+      summary: {
+        ...base.summary,
+        mention_count: mergedMentions.length,
+        mention_group_count: mergedMentionGroups.length
+      },
+      private_segments: mentionResult.private_segments.length > 0
+        ? mentionResult.private_segments
+        : base.private_segments,
+      mentions: mergedMentions,
+      mention_groups: mergedMentionGroups,
+      diagnostics: {
+        ...base.diagnostics,
+        truncated: Boolean(base.diagnostics.truncated || mentionResult.diagnostics.truncated),
+        scanned_dbs: Math.max(base.diagnostics.scanned_dbs || 0, mentionResult.diagnostics.scanned_dbs || 0),
+        elapsed_ms: Math.max(base.diagnostics.elapsed_ms || 0, mentionResult.diagnostics.elapsed_ms || 0)
+      }
+    }
+  }
+
+  private shouldRunMyFootprintHeavyDebug(): boolean {
+    const flag = String(process.env.WEFLOW_MY_FOOTPRINT_DEBUG || '').trim().toLowerCase()
+    return flag === '1' || flag === 'true' || flag === 'yes' || flag === 'on'
+  }
+
+  private async logMyFootprintZeroMentionDebug(params: {
+    begin: number
+    end: number
+    myWxid: string
+    groupSessionIds: string[]
+    nativeData: MyFootprintData
+  }): Promise<void> {
+    try {
+      const identityKeySet = this.buildMyFootprintIdentitySet(params.myWxid)
+      const identitySet = Array.from(identityKeySet)
+      console.warn(
+        `[MyFootprint][debug] zero mentions: myWxid=${params.myWxid} identityKeys=${identitySet.join('|')} groups=${params.groupSessionIds.length} nativeMentions=${params.nativeData.mentions.length} nativeMentionGroups=${params.nativeData.mention_groups.length} scannedDbs=${params.nativeData.diagnostics.scanned_dbs}`
+      )
+
+      if (params.nativeData.mentions.length > 0) {
+        const samples = params.nativeData.mentions.slice(0, 5).map((item) => {
+          const tokens = this.extractAtUserListTokensFromSource(item.source)
+          const matched = tokens.some((token) => this.matchesMyFootprintIdentity(token, identityKeySet))
+          return {
+            sessionId: item.session_id,
+            localId: item.local_id,
+            createTime: item.create_time,
+            tokens,
+            matched
+          }
+        })
+        console.warn(`[MyFootprint][debug] native mention samples=${JSON.stringify(samples)}`)
+      }
+
+      const allGroups = params.groupSessionIds
+      console.warn(`[MyFootprint][debug] start group scan: totalGroups=${allGroups.length}`)
+      let skippedNoTableGroups = 0
+      let sqlProbeCount = 0
+      let nativeSingleProbeCount = 0
+      for (let index = 0; index < allGroups.length; index += 1) {
+        const sessionId = allGroups[index]
+        const cursorResult = await wcdbService.openMessageCursorLite(
+          sessionId,
+          120,
+          false,
+          params.begin,
+          params.end
+        )
+        if (!cursorResult.success || !cursorResult.cursor) {
+          const openCursorError = String(cursorResult.error || 'unknown')
+          if (openCursorError.includes('-3')) {
+            skippedNoTableGroups += 1
+            console.warn(`[MyFootprint][debug][${index + 1}/${allGroups.length}][${sessionId}] skipped(no message table): ${openCursorError}`)
+          } else {
+            console.warn(`[MyFootprint][debug][${index + 1}/${allGroups.length}][${sessionId}] open cursor failed: ${openCursorError}`)
+          }
+          continue
+        }
+
+        let rows = 0
+        let atContentRows = 0
+        let sourcePresentRows = 0
+        let atUserListRows = 0
+        let matchedRows = 0
+        const unmatchedSamples: Array<{
+          localId: number
+          createTime: number
+          tokens: string[]
+          sourcePreview: string
+        }> = []
+
+        let hasMore = true
+        try {
+          while (hasMore && rows < 200) {
+            const batchResult = await wcdbService.fetchMessageBatch(cursorResult.cursor)
+            if (!batchResult.success || !Array.isArray(batchResult.rows)) {
+              break
+            }
+            hasMore = Boolean(batchResult.hasMore)
+            for (const row of batchResult.rows as Array<Record<string, any>>) {
+              rows += 1
+              if (rows > 200) break
+
+              const messageContentRaw = row.message_content ?? row.messageContent ?? row.content
+              const hasAtInContent = this.footprintMessageLikelyContainsAt(messageContentRaw)
+              if (hasAtInContent) atContentRows += 1
+
+              const sourceRaw = row.source ?? row.msg_source ?? row.message_source
+              if (sourceRaw !== null && sourceRaw !== undefined && String(sourceRaw).trim().length > 0) {
+                sourcePresentRows += 1
+              }
+              if (!hasAtInContent) continue
+
+              const tokens = this.extractAtUserListTokensFromSource(sourceRaw)
+              if (tokens.length > 0) atUserListRows += 1
+              const matched = tokens.some((token) => this.matchesMyFootprintIdentity(token, identityKeySet))
+              if (matched) {
+                matchedRows += 1
+              } else if (tokens.length > 0 && unmatchedSamples.length < 3) {
+                const sourceDecoded = this.decodeMaybeCompressed(sourceRaw, 'footprint_source') || String(sourceRaw || '')
+                unmatchedSamples.push({
+                  localId: this.toSafeInt(row.local_id, 0),
+                  createTime: this.toSafeInt(row.create_time, 0),
+                  tokens,
+                  sourcePreview: sourceDecoded.replace(/\s+/g, ' ').slice(0, 260)
+                })
+              }
+            }
+          }
+        } finally {
+          await wcdbService.closeMessageCursor(cursorResult.cursor).catch(() => {})
+        }
+
+        console.warn(
+          `[MyFootprint][debug][${index + 1}/${allGroups.length}][${sessionId}] rows=${rows} atContentRows=${atContentRows} sourcePresentRows=${sourcePresentRows} atUserListRows=${atUserListRows} matchedRows=${matchedRows}`
+        )
+        if (unmatchedSamples.length > 0) {
+          console.warn(`[MyFootprint][debug][${sessionId}] unmatchedSamples=${JSON.stringify(unmatchedSamples)}`)
+        }
+
+        if ((matchedRows > 0 || atContentRows > 0 || atUserListRows > 0) && sqlProbeCount < 6) {
+          sqlProbeCount += 1
+          await this.logMyFootprintNativeSqlProbe(sessionId, params.begin, params.end)
+        }
+        if (matchedRows > 0 && nativeSingleProbeCount < 4) {
+          nativeSingleProbeCount += 1
+          await this.logMyFootprintNativeSingleGroupProbe(sessionId, params.begin, params.end, params.myWxid)
+        }
+      }
+      if (skippedNoTableGroups > 0) {
+        console.warn(`[MyFootprint][debug] skippedNoTableGroups=${skippedNoTableGroups}/${allGroups.length}`)
+      }
+    } catch (error) {
+      console.warn('[MyFootprint][debug] zero mention diagnostics failed:', error)
+    }
+  }
+
+  private async printMyFootprintNativeLogs(tag: string): Promise<void> {
+    try {
+      const logsResult = await wcdbService.getLogs()
+      if (!logsResult.success || !Array.isArray(logsResult.logs)) {
+        console.warn(`[MyFootprint][native-log][${tag}] getLogs failed: ${logsResult.error || 'unknown'}`)
+        return
+      }
+
+      const logs = logsResult.logs
+        .map((line) => String(line || '').trim())
+        .filter(Boolean)
+      const keywords = [
+        'wcdb_get_my_footprint_stats',
+        'message_db_cache_refresh',
+        'open_message_cursor',
+        'open_message_cursor_lite',
+        'cursor_init',
+        'schema mismatch',
+        'no message db',
+        'get_sessions'
+      ]
+      const related = logs.filter((line) => {
+        const lowered = line.toLowerCase()
+        return keywords.some((keyword) => lowered.includes(keyword.toLowerCase()))
+      })
+
+      console.warn(
+        `[MyFootprint][native-log][${tag}] total=${logs.length} related=${related.length}`
+      )
+      const tail = related.slice(-240)
+      for (const line of tail) {
+        console.warn(`[MyFootprint][native-log] ${line}`)
+      }
+    } catch (error) {
+      console.warn(`[MyFootprint][native-log][${tag}] exception:`, error)
+    }
+  }
+
+  private async logMyFootprintNativeSqlProbe(sessionId: string, begin: number, end: number): Promise<void> {
+    try {
+      const tables = await this.getSessionMessageTables(sessionId)
+      if (!Array.isArray(tables) || tables.length === 0) {
+        console.warn(`[MyFootprint][sql-probe][${sessionId}] no tables`)
+        return
+      }
+
+      const beginTs = this.normalizeTimestampSeconds(begin)
+      const endTs = this.normalizeTimestampSeconds(end)
+      const clauseTime = [
+        beginTs > 0 ? `"create_time" >= ${beginTs}` : '',
+        endTs > 0 ? `"create_time" <= ${endTs}` : ''
+      ].filter(Boolean).join(' AND ')
+      const whereParts: string[] = []
+      if (clauseTime) whereParts.push(clauseTime)
+      whereParts.push(`"source" IS NOT NULL`)
+      whereParts.push(`"source" != ''`)
+      whereParts.push(`(("message_content" IS NOT NULL AND "message_content" != '' AND (instr("message_content", '@') > 0 OR instr("message_content", '＠') > 0)) OR instr(lower("source"), 'atuserlist') > 0)`)
+      const whereSql = whereParts.length > 0 ? ` WHERE ${whereParts.join(' AND ')}` : ''
+
+      let total = 0
+      for (const table of tables) {
+        const tableName = String(table.tableName || '').trim()
+        const dbPath = String(table.dbPath || '').trim()
+        if (!tableName || !dbPath) continue
+        const sql = `SELECT COUNT(1) AS cnt FROM ${this.quoteSqlIdentifier(tableName)}${whereSql}`
+        const result = await wcdbService.execQuery('message', dbPath, sql)
+        if (!result.success || !Array.isArray(result.rows) || result.rows.length === 0) {
+          console.warn(`[MyFootprint][sql-probe][${sessionId}] query failed db=${dbPath} table=${tableName} err=${result.error || 'unknown'}`)
+          continue
+        }
+        const cnt = this.toSafeInt((result.rows[0] as Record<string, any>).cnt, 0)
+        total += cnt
+        if (cnt > 0) {
+          console.warn(`[MyFootprint][sql-probe][${sessionId}] db=${dbPath} table=${tableName} cnt=${cnt}`)
+        }
+      }
+      console.warn(`[MyFootprint][sql-probe][${sessionId}] total=${total}`)
+    } catch (error) {
+      console.warn(`[MyFootprint][sql-probe][${sessionId}] exception:`, error)
+    }
+  }
+
+  private async logMyFootprintNativeSingleGroupProbe(sessionId: string, begin: number, end: number, myWxid: string): Promise<void> {
+    try {
+      const probeResult = await wcdbService.getMyFootprintStats({
+        beginTimestamp: begin,
+        endTimestamp: end,
+        myWxid,
+        privateSessionIds: [],
+        groupSessionIds: [sessionId],
+        mentionLimit: 0,
+        privateLimit: 0,
+        mentionMode: 'text_at_me'
+      })
+      if (!probeResult.success || !probeResult.data) {
+        console.warn(`[MyFootprint][single-native][${sessionId}] failed err=${probeResult.error || 'unknown'}`)
+        return
+      }
+
+      const raw = this.normalizeMyFootprintData(probeResult.data)
+      const first = raw.mentions[0]
+      console.warn(
+        `[MyFootprint][single-native][${sessionId}] mentions=${raw.mentions.length} groups=${raw.mention_groups.length} truncated=${raw.diagnostics.truncated} firstLocalId=${first?.local_id || 0} firstTs=${first?.create_time || 0}`
+      )
+    } catch (error) {
+      console.warn(`[MyFootprint][single-native][${sessionId}] exception:`, error)
+    }
+  }
+
+  private async getMyFootprintStatsByCursorFallback(params: {
+    begin: number
+    end: number
+    myWxid: string
+    privateSessionIds: string[]
+    groupSessionIds: string[]
+    mentionLimit: number
+    privateLimit: number
+    skipPrivateScan?: boolean
+    mentionScanLimitPerGroup?: number
+  }): Promise<{ success: boolean; data?: MyFootprintData; error?: string }> {
+    const startedAt = Date.now()
+    let truncated = false
+
+    try {
+      const privateSessionMap = new Map<string, MyFootprintPrivateSession>()
+      type PrivateSegmentWorking = {
+        segment_index: number
+        start_ts: number
+        end_ts: number
+        incoming_count: number
+        outgoing_count: number
+        first_incoming_ts: number
+        first_reply_ts: number
+        anchor_local_id: number
+        anchor_create_time: number
+        latest_local_id: number
+        latest_create_time: number
+      }
+      const privateSegments: MyFootprintPrivateSegment[] = []
+      const mentionGroupsMap = new Map<string, MyFootprintMentionGroup>()
+      const mentions: MyFootprintMentionItem[] = []
+      const mentionIdentitySet = this.buildMyFootprintIdentitySet(params.myWxid)
+      const mentionSourceMatchCache = new Map<string, boolean>()
+      const mentionScanLimit = Number.isFinite(params.mentionScanLimitPerGroup as number)
+        ? Math.max(60, Math.floor(Number(params.mentionScanLimitPerGroup)))
+        : Math.max(params.mentionLimit * 12, 4000)
+      const privateScanLimitPerSession = Math.max(
+        120,
+        Math.min(
+          600,
+          Math.floor((params.privateLimit * 2) / Math.max(params.privateSessionIds.length || 1, 1))
+        )
+      )
+      const privateBatchSize = Math.min(200, privateScanLimitPerSession)
+      const privateSessionGapSeconds = 10 * 60
+      const mentionBatchSize = 360
+      const skipPrivateScan = params.skipPrivateScan === true
+
+      if (!skipPrivateScan) for (const sessionId of params.privateSessionIds) {
+        const cursorResult = await wcdbService.openMessageCursorLite(
+          sessionId,
+          privateBatchSize,
+          true,
+          params.begin,
+          params.end
+        )
+        if (!cursorResult.success || !cursorResult.cursor) continue
+
+        const stat: MyFootprintPrivateSession = {
+          session_id: sessionId,
+          incoming_count: 0,
+          outgoing_count: 0,
+          replied: false,
+          first_incoming_ts: 0,
+          first_reply_ts: 0,
+          latest_ts: 0,
+          anchor_local_id: 0,
+          anchor_create_time: 0
+        }
+        let segmentCursor = 0
+        let activeSegment: PrivateSegmentWorking | null = null
+        let lastSegmentMessageTs = 0
+        const commitActiveSegment = () => {
+          if (!activeSegment) return
+
+          const normalizedStart = activeSegment.start_ts > 0 ? activeSegment.start_ts : activeSegment.anchor_create_time
+          const normalizedEnd = activeSegment.end_ts > 0 ? activeSegment.end_ts : normalizedStart
+          const incomingCount = Math.max(0, activeSegment.incoming_count)
+          const outgoingCount = Math.max(0, activeSegment.outgoing_count)
+          const messageCount = incomingCount + outgoingCount
+          if (normalizedStart > 0 && messageCount > 0) {
+            privateSegments.push({
+              session_id: sessionId,
+              segment_index: activeSegment.segment_index,
+              start_ts: normalizedStart,
+              end_ts: normalizedEnd,
+              duration_sec: Math.max(0, normalizedEnd - normalizedStart),
+              incoming_count: incomingCount,
+              outgoing_count: outgoingCount,
+              message_count: messageCount,
+              replied: incomingCount > 0 && outgoingCount > 0,
+              first_incoming_ts: activeSegment.first_incoming_ts,
+              first_reply_ts: activeSegment.first_reply_ts,
+              latest_ts: normalizedEnd,
+              anchor_local_id: activeSegment.anchor_local_id,
+              anchor_create_time: normalizedStart
+            })
+          }
+          activeSegment = null
+        }
+
+        let processed = 0
+        let hasMore = true
+        try {
+          while (hasMore) {
+            const batchResult = await wcdbService.fetchMessageBatch(cursorResult.cursor)
+            if (!batchResult.success || !Array.isArray(batchResult.rows)) {
+              break
+            }
+            hasMore = Boolean(batchResult.hasMore)
+            for (const row of batchResult.rows as Array<Record<string, any>>) {
+              if (processed >= privateScanLimitPerSession) {
+                if (hasMore || batchResult.rows.length > 0) truncated = true
+                hasMore = false
+                break
+              }
+              processed += 1
+
+              const createTime = this.toSafeInt(row.create_time, 0)
+              const localId = this.toSafeInt(row.local_id, 0)
+              const isSend = this.resolveFootprintRowIsSend(row, params.myWxid)
+
+              if (createTime > 0) {
+                const startNewSegment = !activeSegment
+                  || (lastSegmentMessageTs > 0 && createTime - lastSegmentMessageTs > privateSessionGapSeconds)
+                if (startNewSegment) {
+                  commitActiveSegment()
+                  segmentCursor += 1
+                  activeSegment = {
+                    segment_index: segmentCursor,
+                    start_ts: createTime,
+                    end_ts: createTime,
+                    incoming_count: 0,
+                    outgoing_count: 0,
+                    first_incoming_ts: 0,
+                    first_reply_ts: 0,
+                    anchor_local_id: localId,
+                    anchor_create_time: createTime,
+                    latest_local_id: localId,
+                    latest_create_time: createTime
+                  }
+                }
+              } else if (!activeSegment) {
+                segmentCursor += 1
+                activeSegment = {
+                  segment_index: segmentCursor,
+                  start_ts: 0,
+                  end_ts: 0,
+                  incoming_count: 0,
+                  outgoing_count: 0,
+                  first_incoming_ts: 0,
+                  first_reply_ts: 0,
+                  anchor_local_id: localId,
+                  anchor_create_time: 0,
+                  latest_local_id: localId,
+                  latest_create_time: 0
+                }
+              }
+
+              if (isSend) {
+                stat.outgoing_count += 1
+                if (
+                  createTime > 0
+                  && stat.first_incoming_ts > 0
+                  && createTime >= stat.first_incoming_ts
+                  && stat.first_reply_ts <= 0
+                ) {
+                  stat.first_reply_ts = createTime
+                }
+                if (activeSegment) {
+                  activeSegment.outgoing_count += 1
+                  if (
+                    createTime > 0
+                    && activeSegment.first_incoming_ts > 0
+                    && createTime >= activeSegment.first_incoming_ts
+                    && activeSegment.first_reply_ts <= 0
+                  ) {
+                    activeSegment.first_reply_ts = createTime
+                  }
+                }
+              } else {
+                stat.incoming_count += 1
+                if (stat.first_incoming_ts <= 0 || (createTime > 0 && createTime < stat.first_incoming_ts)) {
+                  stat.first_incoming_ts = createTime
+                }
+                if (activeSegment) {
+                  activeSegment.incoming_count += 1
+                  if (activeSegment.first_incoming_ts <= 0 || (createTime > 0 && createTime < activeSegment.first_incoming_ts)) {
+                    activeSegment.first_incoming_ts = createTime
+                  }
+                }
+              }
+
+              if (stat.latest_ts <= 0 || createTime > stat.latest_ts || (createTime === stat.latest_ts && localId > stat.anchor_local_id)) {
+                stat.latest_ts = createTime
+                stat.anchor_local_id = localId
+                stat.anchor_create_time = createTime
+              }
+
+              if (activeSegment && createTime > 0) {
+                activeSegment.end_ts = createTime
+                activeSegment.latest_create_time = createTime
+                activeSegment.latest_local_id = localId
+                lastSegmentMessageTs = createTime
+              }
+            }
+          }
+          if (hasMore) truncated = true
+        } finally {
+          await wcdbService.closeMessageCursor(cursorResult.cursor).catch(() => {})
+        }
+        commitActiveSegment()
+        stat.replied = stat.incoming_count > 0 && stat.outgoing_count > 0
+
+        if (stat.incoming_count > 0 || stat.outgoing_count > 0 || stat.latest_ts > 0) {
+          privateSessionMap.set(sessionId, stat)
+        }
+      }
+
+      for (const sessionId of params.groupSessionIds) {
+        if (mentions.length >= params.mentionLimit) {
+          truncated = true
+          break
+        }
+        const cursorResult = await wcdbService.openMessageCursorLite(
+          sessionId,
+          mentionBatchSize,
+          false,
+          params.begin,
+          params.end
+        )
+        if (!cursorResult.success || !cursorResult.cursor) continue
+
+        let scanned = 0
+        let hasMore = true
+        try {
+          while (hasMore && scanned < mentionScanLimit) {
+            const batchResult = await wcdbService.fetchMessageBatch(cursorResult.cursor)
+            if (!batchResult.success || !Array.isArray(batchResult.rows)) {
+              break
+            }
+            hasMore = Boolean(batchResult.hasMore)
+            for (const row of batchResult.rows as Array<Record<string, any>>) {
+              if (mentions.length >= params.mentionLimit) {
+                truncated = true
+                hasMore = false
+                break
+              }
+              scanned += 1
+              const messageContentRaw = row.message_content ?? row.messageContent ?? row.content
+              if (!this.footprintMessageLikelyContainsAt(messageContentRaw)) continue
+              const sourceRaw = row.source ?? row.msg_source ?? row.message_source
+              let sourceMatched = false
+              if (typeof sourceRaw === 'string') {
+                const sourceKey = sourceRaw
+                const cachedMatched = mentionSourceMatchCache.get(sourceKey)
+                if (cachedMatched !== undefined) {
+                  sourceMatched = cachedMatched
+                } else {
+                  sourceMatched = this.sourceAtUserListContainsWithIdentitySet(sourceRaw, mentionIdentitySet)
+                  if (mentionSourceMatchCache.size < 8192) {
+                    mentionSourceMatchCache.set(sourceKey, sourceMatched)
+                  }
+                }
+              } else {
+                sourceMatched = this.sourceAtUserListContainsWithIdentitySet(sourceRaw, mentionIdentitySet)
+              }
+              if (!sourceMatched) continue
+              const normalizedSource = this.normalizeFootprintSourceForOutput(sourceRaw)
+
+              let senderUsername = String(row.sender_username || row.senderUsername || '').trim()
+              if (!senderUsername && row._db_path && row.real_sender_id) {
+                senderUsername = await this.resolveMessageSenderUsernameById(
+                  String(row._db_path),
+                  row.real_sender_id
+                ) || ''
+              }
+
+              const mention: MyFootprintMentionItem = {
+                session_id: sessionId,
+                local_id: this.toSafeInt(row.local_id, 0),
+                create_time: this.toSafeInt(row.create_time, 0),
+                sender_username: senderUsername,
+                message_content: String(row.message_content || row.messageContent || ''),
+                source: normalizedSource
+              }
+              mentions.push(mention)
+
+              const group = mentionGroupsMap.get(sessionId) || {
+                session_id: sessionId,
+                count: 0,
+                latest_ts: 0
+              }
+              group.count += 1
+              if (mention.create_time > group.latest_ts) group.latest_ts = mention.create_time
+              mentionGroupsMap.set(sessionId, group)
+            }
+          }
+          if (hasMore || scanned >= mentionScanLimit) {
+            truncated = true
+          }
+        } finally {
+          await wcdbService.closeMessageCursor(cursorResult.cursor).catch(() => {})
+        }
+      }
+
+      mentions.sort((a, b) => {
+        if (b.create_time !== a.create_time) return b.create_time - a.create_time
+        return b.local_id - a.local_id
+      })
+      if (mentions.length > params.mentionLimit) {
+        mentions.length = params.mentionLimit
+        truncated = true
+      }
+
+      const private_sessions = Array.from(privateSessionMap.values())
+        .sort((a, b) => {
+          if (b.latest_ts !== a.latest_ts) return b.latest_ts - a.latest_ts
+          return a.session_id.localeCompare(b.session_id)
+        })
+      const private_segments = [...privateSegments]
+        .sort((a, b) => {
+          if (a.start_ts !== b.start_ts) return a.start_ts - b.start_ts
+          if (a.session_id !== b.session_id) return a.session_id.localeCompare(b.session_id)
+          return a.segment_index - b.segment_index
+        })
+      const mention_groups = Array.from(mentionGroupsMap.values())
+        .sort((a, b) => {
+          if (b.count !== a.count) return b.count - a.count
+          if (b.latest_ts !== a.latest_ts) return b.latest_ts - a.latest_ts
+          return a.session_id.localeCompare(b.session_id)
+        })
+
+      const private_inbound_people = private_sessions.filter((item) => item.incoming_count > 0).length
+      const private_replied_people = private_sessions.filter((item) => item.replied).length
+      const private_outbound_people = private_sessions.filter((item) => item.outgoing_count > 0).length
+      const mention_count = mention_groups.reduce((sum, item) => sum + item.count, 0)
+      const mention_group_count = mention_groups.length
+
+      const summary: MyFootprintSummary = {
+        private_inbound_people,
+        private_replied_people,
+        private_outbound_people,
+        private_reply_rate: private_inbound_people > 0 ? private_replied_people / private_inbound_people : 0,
+        mention_count,
+        mention_group_count
+      }
+
+      const diagnostics: MyFootprintDiagnostics = {
+        truncated,
+        scanned_dbs: 0,
+        elapsed_ms: Math.max(0, Date.now() - startedAt)
+      }
+
+      return {
+        success: true,
+        data: {
+          summary,
+          private_sessions,
+          private_segments,
+          mentions,
+          mention_groups,
+          diagnostics
+        }
+      }
+    } catch (error) {
+      return { success: false, error: String(error) }
+    }
+  }
+
+  private async enrichMyFootprintData(data: MyFootprintData): Promise<MyFootprintData> {
+    try {
+      const sessionIds = Array.from(new Set([
+        ...data.private_sessions.map((item) => item.session_id),
+        ...data.private_segments.map((item) => item.session_id),
+        ...data.mention_groups.map((item) => item.session_id),
+        ...data.mentions.map((item) => item.session_id)
+      ].filter(Boolean)))
+      const senderUsernames = Array.from(new Set(
+        data.mentions
+          .map((item) => item.sender_username)
+          .filter((value) => String(value || '').trim())
+      ))
+
+      const usernames = Array.from(new Set([...sessionIds, ...senderUsernames]))
+      if (usernames.length === 0) return data
+
+      const enrichResult = await this.enrichSessionsContactInfo(usernames)
+      if (!enrichResult.success || !enrichResult.contacts) return data
+      const contacts = enrichResult.contacts
+
+      const nextPrivateSessions = data.private_sessions.map((item) => {
+        const contact = contacts[item.session_id]
+        return {
+          ...item,
+          displayName: contact?.displayName || item.displayName,
+          avatarUrl: contact?.avatarUrl || item.avatarUrl
+        }
+      })
+      const nextPrivateSegments = data.private_segments.map((item) => {
+        const contact = contacts[item.session_id]
+        return {
+          ...item,
+          displayName: contact?.displayName || item.displayName,
+          avatarUrl: contact?.avatarUrl || item.avatarUrl
+        }
+      })
+
+      const nextMentionGroups = data.mention_groups.map((item) => {
+        const contact = contacts[item.session_id]
+        return {
+          ...item,
+          displayName: contact?.displayName || item.displayName,
+          avatarUrl: contact?.avatarUrl || item.avatarUrl
+        }
+      })
+
+      const nextMentions = await Promise.all(data.mentions.map(async (item) => {
+        const sessionContact = contacts[item.session_id]
+        const senderContact = item.sender_username ? contacts[item.sender_username] : undefined
+
+        let normalizedContent = this.normalizeMyFootprintMentionContent(item.message_content)
+        if (this.isLikelyUnreadableFootprintContent(normalizedContent) && item.session_id && item.local_id > 0) {
+          const detailResult = await this.getMessageById(item.session_id, item.local_id)
+          if (detailResult.success && detailResult.message) {
+            const detailMessage = detailResult.message
+            const detailRaw = String(
+              detailMessage.rawContent
+              || detailMessage.content
+              || detailMessage.parsedContent
+              || ''
+            )
+            const resolvedFromDetail = this.normalizeMyFootprintMentionContent(detailRaw)
+            if (resolvedFromDetail && !this.isLikelyUnreadableFootprintContent(resolvedFromDetail)) {
+              normalizedContent = resolvedFromDetail
+            } else {
+              const parsedFallback = String(detailMessage.parsedContent || '').trim()
+              if (parsedFallback && !this.isLikelyUnreadableFootprintContent(parsedFallback)) {
+                normalizedContent = parsedFallback
+              }
+            }
+          }
+        }
+
+        return {
+          ...item,
+          message_content: normalizedContent,
+          sessionDisplayName: sessionContact?.displayName || item.sessionDisplayName,
+          senderDisplayName: senderContact?.displayName || item.senderDisplayName || item.sender_username,
+          senderAvatarUrl: senderContact?.avatarUrl || item.senderAvatarUrl
+        }
+      }))
+
+      return {
+        ...data,
+        private_sessions: nextPrivateSessions,
+        private_segments: nextPrivateSegments,
+        mention_groups: nextMentionGroups,
+        mentions: nextMentions
+      }
+    } catch (error) {
+      console.error('[ChatService] 补充我的足迹展示信息失败:', error)
+      return data
+    }
+  }
+
+  private normalizeMyFootprintMentionContent(rawContent: unknown): string {
+    const decodedRaw = this.decodeMaybeCompressed(rawContent, 'footprint_message_content')
+    let content = String(decodedRaw || rawContent || '')
+    if (!content) return ''
+
+    content = this.cleanUtf16(this.decodeHtmlEntities(content)).trim()
+    if (!content) return ''
+
+    const looksLikeXml = content.includes('<appmsg')
+      || content.includes('&lt;appmsg')
+      || content.includes('<msg')
+      || content.includes('&lt;msg')
+
+    if (looksLikeXml) {
+      const xml = this.decodeHtmlEntities(content)
+      const type49Info = this.parseType49Message(xml)
+
+      if (type49Info.appMsgKind === 'quote') {
+        const title = this.stripSenderPrefix(this.extractXmlValue(xml, 'title'))
+        const quotedSender = String(type49Info.quotedSender || '').trim()
+        const quotedContent = this.sanitizeQuotedContent(String(type49Info.quotedContent || '').trim())
+        if (title) {
+          if (quotedContent) {
+            return `${title}\n\n引用：${quotedSender ? `${quotedSender}：` : ''}${quotedContent}`
+          }
+          return title
+        }
+        if (quotedContent) {
+          return quotedSender ? `${quotedSender}：${quotedContent}` : quotedContent
+        }
+      }
+
+      const parsed = this.parseMessageContent(xml, 49)
+      const normalizedParsed = this.stripSenderPrefix(String(parsed || '').trim())
+      if (normalizedParsed && normalizedParsed !== '[链接]' && normalizedParsed !== '[消息]') {
+        return normalizedParsed
+      }
+
+      const xmlTitle = this.stripSenderPrefix(this.extractXmlValue(xml, 'title'))
+      if (xmlTitle) return xmlTitle
+    }
+
+    return this.stripSenderPrefix(content)
+  }
+
+  private isLikelyUnreadableFootprintContent(content: string): boolean {
+    const text = String(content || '').trim()
+    if (!text) return false
+    const compact = this.compactEncodedPayload(text)
+    if (compact.length <= 80) return false
+    if (this.looksLikeHex(compact)) return true
+    if (this.looksLikeBase64(compact) && !compact.includes('<') && !compact.includes('>')) return true
+    return false
+  }
+
+  private formatFootprintTime(timestamp: number): string {
+    if (!Number.isFinite(timestamp) || timestamp <= 0) return ''
+    const date = new Date(timestamp * 1000)
+    const y = date.getFullYear()
+    const m = `${date.getMonth() + 1}`.padStart(2, '0')
+    const d = `${date.getDate()}`.padStart(2, '0')
+    const hh = `${date.getHours()}`.padStart(2, '0')
+    const mm = `${date.getMinutes()}`.padStart(2, '0')
+    const ss = `${date.getSeconds()}`.padStart(2, '0')
+    return `${y}-${m}-${d} ${hh}:${mm}:${ss}`
+  }
+
+  private escapeCsvCell(value: unknown): string {
+    const text = String(value ?? '')
+    if (!text) return ''
+    if (!/[",\n\r]/.test(text)) return text
+    return `"${text.replace(/"/g, '""')}"`
+  }
+
+  private buildMyFootprintCsv(data: MyFootprintData): string {
+    const lines: string[] = []
+    const pushRow = (...columns: unknown[]) => {
+      lines.push(columns.map((value) => this.escapeCsvCell(value)).join(','))
+    }
+
+    pushRow('模块', '指标', '数值')
+    pushRow('summary', '私聊找我人数', data.summary.private_inbound_people)
+    pushRow('summary', '我回复人数', data.summary.private_replied_people)
+    pushRow('summary', '我主动联系人数', data.summary.private_outbound_people)
+    pushRow('summary', '私聊回复率', data.summary.private_reply_rate)
+    pushRow('summary', '@我次数', data.summary.mention_count)
+    pushRow('summary', '@我群聊数', data.summary.mention_group_count)
+    pushRow('summary', '诊断:是否截断', data.diagnostics.truncated ? 'true' : 'false')
+    pushRow('summary', '诊断:扫描分库数', data.diagnostics.scanned_dbs)
+    pushRow('summary', '诊断:耗时ms', data.diagnostics.elapsed_ms)
+
+    lines.push('')
+    pushRow('private_sessions', 'session_id', 'display_name', 'incoming_count', 'outgoing_count', 'replied', 'first_incoming_ts', 'first_reply_ts', 'latest_ts', 'anchor_local_id', 'anchor_create_time')
+    for (const row of data.private_sessions) {
+      pushRow(
+        'private_sessions',
+        row.session_id,
+        row.displayName || '',
+        row.incoming_count,
+        row.outgoing_count,
+        row.replied ? 'true' : 'false',
+        this.formatFootprintTime(row.first_incoming_ts),
+        this.formatFootprintTime(row.first_reply_ts),
+        this.formatFootprintTime(row.latest_ts),
+        row.anchor_local_id,
+        row.anchor_create_time
+      )
+    }
+
+    lines.push('')
+    pushRow(
+      'private_segments',
+      'session_id',
+      'display_name',
+      'segment_index',
+      'start_ts',
+      'end_ts',
+      'duration_sec',
+      'incoming_count',
+      'outgoing_count',
+      'message_count',
+      'replied',
+      'first_incoming_ts',
+      'first_reply_ts',
+      'latest_ts',
+      'anchor_local_id',
+      'anchor_create_time'
+    )
+    for (const row of data.private_segments) {
+      pushRow(
+        'private_segments',
+        row.session_id,
+        row.displayName || '',
+        row.segment_index,
+        this.formatFootprintTime(row.start_ts),
+        this.formatFootprintTime(row.end_ts),
+        row.duration_sec,
+        row.incoming_count,
+        row.outgoing_count,
+        row.message_count,
+        row.replied ? 'true' : 'false',
+        this.formatFootprintTime(row.first_incoming_ts),
+        this.formatFootprintTime(row.first_reply_ts),
+        this.formatFootprintTime(row.latest_ts),
+        row.anchor_local_id,
+        row.anchor_create_time
+      )
+    }
+
+    lines.push('')
+    pushRow('mentions', 'session_id', 'session_display_name', 'local_id', 'create_time', 'sender_username', 'sender_display_name', 'message_content', 'source')
+    for (const row of data.mentions) {
+      pushRow(
+        'mentions',
+        row.session_id,
+        row.sessionDisplayName || '',
+        row.local_id,
+        this.formatFootprintTime(row.create_time),
+        row.sender_username,
+        row.senderDisplayName || '',
+        row.message_content,
+        row.source
+      )
+    }
+
+    lines.push('')
+    pushRow('mention_groups', 'session_id', 'display_name', 'count', 'latest_ts')
+    for (const row of data.mention_groups) {
+      pushRow(
+        'mention_groups',
+        row.session_id,
+        row.displayName || '',
+        row.count,
+        this.formatFootprintTime(row.latest_ts)
+      )
+    }
+
+    return lines.join('\n')
   }
 
   private async parseMessage(row: any, options?: { source?: 'search' | 'detail'; sessionId?: string }): Promise<Message> {

@@ -56,6 +56,8 @@ Thumbs.db
 *.aps
 
 wcdb/
+!resources/wcdb/
+!resources/wcdb/**
 xkey/
 server/
 *info
@@ -73,3 +75,4 @@ pnpm-lock.yaml
 wechat-research-site
 .codex
 weflow-web-offical
+Insight

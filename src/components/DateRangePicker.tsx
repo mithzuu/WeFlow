@@ -29,6 +29,20 @@ function DateRangePicker({ startDate, endDate, onStartDateChange, onEndDateChang
   const [showYearMonthPicker, setShowYearMonthPicker] = useState(false)
   const containerRef = useRef<HTMLDivElement>(null)
 
+  const [internalStart, setInternalStart] = useState(startDate)
+  const [internalEnd, setInternalEnd] = useState(endDate)
+
+  useEffect(() => {
+    setInternalStart(startDate)
+    setInternalEnd(endDate)
+  }, [startDate, endDate])
+
+  useEffect(() => {
+    if (isOpen) {
+      setSelectingStart(true)
+    }
+  }, [isOpen])
+
   // 点击外部关闭
   useEffect(() => {
     const handleClickOutside = (e: MouseEvent) => {
@@ -63,8 +77,10 @@ function DateRangePicker({ startDate, endDate, onStartDateChange, onEndDateChang
       const end = new Date()
       const start = new Date()
       start.setDate(start.getDate() - days)
-      onStartDateChange(start.toISOString().split('T')[0])
-      onEndDateChange(end.toISOString().split('T')[0])
+      const startStr = `${start.getFullYear()}-${String(start.getMonth() + 1).padStart(2, '0')}-${String(start.getDate()).padStart(2, '0')}`
+      const endStr = `${end.getFullYear()}-${String(end.getMonth() + 1).padStart(2, '0')}-${String(end.getDate()).padStart(2, '0')}`
+      onStartDateChange(startStr)
+      onEndDateChange(endStr)
     }
     setIsOpen(false)
     setTimeout(() => onRangeComplete?.(), 0)
@@ -89,38 +105,46 @@ function DateRangePicker({ startDate, endDate, onStartDateChange, onEndDateChang
     const dateStr = `${currentMonth.getFullYear()}-${String(currentMonth.getMonth() + 1).padStart(2, '0')}-${String(day).padStart(2, '0')}`
 
     if (selectingStart) {
-      onStartDateChange(dateStr)
-      if (endDate && dateStr > endDate) {
-        onEndDateChange('')
+      setInternalStart(dateStr)
+      if (internalEnd && dateStr > internalEnd) {
+        setInternalEnd('')
       }
       setSelectingStart(false)
     } else {
-      if (dateStr < startDate) {
-        onStartDateChange(dateStr)
-        onEndDateChange(startDate)
-      } else {
-        onEndDateChange(dateStr)
+      let finalStart = internalStart
+      let finalEnd = dateStr
+      
+      if (dateStr < internalStart) {
+        finalStart = dateStr
+        finalEnd = internalStart
       }
+      
+      setInternalStart(finalStart)
+      setInternalEnd(finalEnd)
+      
       setSelectingStart(true)
       setIsOpen(false)
+      
+      onStartDateChange(finalStart)
+      onEndDateChange(finalEnd)
       setTimeout(() => onRangeComplete?.(), 0)
     }
   }
 
   const isInRange = (day: number) => {
-    if (!startDate || !endDate) return false
+    if (!internalStart || !internalEnd) return false
     const dateStr = `${currentMonth.getFullYear()}-${String(currentMonth.getMonth() + 1).padStart(2, '0')}-${String(day).padStart(2, '0')}`
-    return dateStr >= startDate && dateStr <= endDate
+    return dateStr >= internalStart && dateStr <= internalEnd
   }
 
   const isStartDate = (day: number) => {
     const dateStr = `${currentMonth.getFullYear()}-${String(currentMonth.getMonth() + 1).padStart(2, '0')}-${String(day).padStart(2, '0')}`
-    return dateStr === startDate
+    return dateStr === internalStart
   }
 
   const isEndDate = (day: number) => {
     const dateStr = `${currentMonth.getFullYear()}-${String(currentMonth.getMonth() + 1).padStart(2, '0')}-${String(day).padStart(2, '0')}`
-    return dateStr === endDate
+    return dateStr === internalEnd
   }
 
   const isToday = (day: number) => {

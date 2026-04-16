@@ -9,7 +9,7 @@ import crypto from 'crypto'
 const execFileAsync = promisify(execFile)
 
 type DbKeyResult = { success: boolean; key?: string; error?: string; logs?: string[] }
-type ImageKeyResult = { success: boolean; xorKey?: number; aesKey?: string; error?: string }
+type ImageKeyResult = { success: boolean; xorKey?: number; aesKey?: string; verified?: boolean; error?: string }
 
 export class KeyService {
   private readonly isMac = process.platform === 'darwin'
@@ -61,6 +61,7 @@ export class KeyService {
 
   private getDllPath(): string {
     const isPackaged = typeof app !== 'undefined' && app ? app.isPackaged : process.env.NODE_ENV === 'production'
+    const archDir = process.arch === 'arm64' ? 'arm64' : 'x64'
     const candidates: string[] = []
 
     if (process.env.WX_KEY_DLL_PATH) {
@@ -68,11 +69,20 @@ export class KeyService {
     }
 
     if (isPackaged) {
+      candidates.push(join(process.resourcesPath, 'resources', 'key', 'win32', archDir, 'wx_key.dll'))
+      candidates.push(join(process.resourcesPath, 'resources', 'key', 'win32', 'x64', 'wx_key.dll'))
+      candidates.push(join(process.resourcesPath, 'resources', 'key', 'win32', 'wx_key.dll'))
       candidates.push(join(process.resourcesPath, 'resources', 'wx_key.dll'))
       candidates.push(join(process.resourcesPath, 'wx_key.dll'))
     } else {
       const cwd = process.cwd()
+      candidates.push(join(cwd, 'resources', 'key', 'win32', archDir, 'wx_key.dll'))
+      candidates.push(join(cwd, 'resources', 'key', 'win32', 'x64', 'wx_key.dll'))
+      candidates.push(join(cwd, 'resources', 'key', 'win32', 'wx_key.dll'))
       candidates.push(join(cwd, 'resources', 'wx_key.dll'))
+      candidates.push(join(app.getAppPath(), 'resources', 'key', 'win32', archDir, 'wx_key.dll'))
+      candidates.push(join(app.getAppPath(), 'resources', 'key', 'win32', 'x64', 'wx_key.dll'))
+      candidates.push(join(app.getAppPath(), 'resources', 'key', 'win32', 'wx_key.dll'))
       candidates.push(join(app.getAppPath(), 'resources', 'wx_key.dll'))
     }
 
@@ -804,7 +814,7 @@ export class KeyService {
           if (!this.verifyDerivedAesKey(aesKey, verifyCiphertext)) continue
           onProgress?.(`密钥获取成功 (wxid: ${candidateWxid}, code: ${code})`)
           console.log('[ImageKey] 校验命中: wxid=', candidateWxid, 'code=', code)
-          return { success: true, xorKey, aesKey }
+          return { success: true, xorKey, aesKey, verified: true }
         }
       }
       return { success: false, error: '缓存 code 与当前账号 wxid 未匹配，请确认账号目录后重试，或使用内存扫描' }
@@ -816,7 +826,7 @@ export class KeyService {
     const { xorKey, aesKey } = this.deriveImageKeys(fallbackCode, fallbackWxid)
     onProgress?.(`密钥获取成功 (wxid: ${fallbackWxid}, code: ${fallbackCode})`)
     console.log('[ImageKey] 回退计算: wxid=', fallbackWxid, 'code=', fallbackCode)
-    return { success: true, xorKey, aesKey }
+    return { success: true, xorKey, aesKey, verified: false }
   }
 
   // --- 内存扫描备选方案（融合 Dart+Python 优点）---

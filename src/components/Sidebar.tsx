@@ -1,12 +1,9 @@
 import { useState, useEffect, useRef } from 'react'
 import { NavLink, useLocation, useNavigate } from 'react-router-dom'
-import { Home, MessageSquare, BarChart3, FileText, Settings, Download, Aperture, UserCircle, Lock, LockOpen, ChevronUp, RefreshCw } from 'lucide-react'
+import { Home, MessageSquare, BarChart3, FileText, Settings, Download, Aperture, UserCircle, Lock, LockOpen, ChevronUp, FolderClosed, Footprints, Users } from 'lucide-react'
 import { useAppStore } from '../stores/appStore'
-import { useChatStore } from '../stores/chatStore'
-import { useAnalyticsStore } from '../stores/analyticsStore'
 import * as configService from '../services/config'
 import { onExportSessionStatus, requestExportSessionStatus } from '../services/exportBridge'
-import { UserRound } from 'lucide-react'
 
 import './Sidebar.scss'
 
@@ -19,6 +16,8 @@ interface SidebarUserProfile {
 
 const SIDEBAR_USER_PROFILE_CACHE_KEY = 'sidebar_user_profile_cache_v1'
 const ACCOUNT_PROFILES_CACHE_KEY = 'account_profiles_cache_v1'
+const DEFAULT_DISPLAY_NAME = '微信用户'
+const DEFAULT_SUBTITLE = '微信账号'
 
 interface SidebarUserProfileCache extends SidebarUserProfile {
   updatedAt: number
@@ -33,24 +32,16 @@ interface AccountProfilesCache {
   }
 }
 
-interface WxidOption {
-  wxid: string
-  modifiedTime: number
-  nickname?: string
-  displayName?: string
-  avatarUrl?: string
-}
-
 const readSidebarUserProfileCache = (): SidebarUserProfile | null => {
   try {
     const raw = window.localStorage.getItem(SIDEBAR_USER_PROFILE_CACHE_KEY)
     if (!raw) return null
     const parsed = JSON.parse(raw) as SidebarUserProfileCache
     if (!parsed || typeof parsed !== 'object') return null
-    if (!parsed.wxid || !parsed.displayName) return null
+    if (!parsed.wxid) return null
     return {
       wxid: parsed.wxid,
-      displayName: parsed.displayName,
+      displayName: typeof parsed.displayName === 'string' ? parsed.displayName : '',
       alias: parsed.alias,
       avatarUrl: parsed.avatarUrl
     }
@@ -60,7 +51,7 @@ const readSidebarUserProfileCache = (): SidebarUserProfile | null => {
 }
 
 const writeSidebarUserProfileCache = (profile: SidebarUserProfile): void => {
-  if (!profile.wxid || !profile.displayName) return
+  if (!profile.wxid) return
   try {
     const payload: SidebarUserProfileCache = {
       ...profile,
@@ -115,17 +106,11 @@ function Sidebar({ collapsed }: SidebarProps) {
   const [activeExportTaskCount, setActiveExportTaskCount] = useState(0)
   const [userProfile, setUserProfile] = useState<SidebarUserProfile>({
     wxid: '',
-    displayName: '未识别用户'
+    displayName: DEFAULT_DISPLAY_NAME
   })
   const [isAccountMenuOpen, setIsAccountMenuOpen] = useState(false)
-  const [showSwitchAccountDialog, setShowSwitchAccountDialog] = useState(false)
-  const [wxidOptions, setWxidOptions] = useState<WxidOption[]>([])
-  const [isSwitchingAccount, setIsSwitchingAccount] = useState(false)
   const accountCardWrapRef = useRef<HTMLDivElement | null>(null)
   const setLocked = useAppStore(state => state.setLocked)
-  const isDbConnected = useAppStore(state => state.isDbConnected)
-  const resetChatStore = useChatStore(state => state.reset)
-  const clearAnalyticsStoreCache = useAnalyticsStore(state => state.clearCache)
 
   useEffect(() => {
     window.electronAPI.auth.verifyEnabled().then(setAuthEnabled)
@@ -164,18 +149,20 @@ function Sidebar({ collapsed }: SidebarProps) {
   }, [])
 
   useEffect(() => {
+    let disposed = false
+    let loadSeq = 0
+
     const loadCurrentUser = async () => {
-      const patchUserProfile = (patch: Partial<SidebarUserProfile>, expectedWxid?: string) => {
+      const seq = ++loadSeq
+      const patchUserProfile = (patch: Partial<SidebarUserProfile>) => {
+        if (disposed || seq !== loadSeq) return
         setUserProfile(prev => {
-          if (expectedWxid && prev.wxid && prev.wxid !== expectedWxid) {
-            return prev
-          }
           const next: SidebarUserProfile = {
             ...prev,
             ...patch
           }
-          if (!next.displayName) {
-            next.displayName = next.wxid || '未识别用户'
+          if (typeof next.displayName !== 'string' || next.displayName.length === 0) {
+            next.displayName = DEFAULT_DISPLAY_NAME
           }
           writeSidebarUserProfileCache(next)
           return next
@@ -184,11 +171,33 @@ function Sidebar({ collapsed }: SidebarProps) {
 
       try {
         const wxid = await configService.getMyWxid()
+        if (disposed || seq !== loadSeq) return
         const resolvedWxidRaw = String(wxid || '').trim()
         const cleanedWxid = normalizeAccountId(resolvedWxidRaw)
         const resolvedWxid = cleanedWxid || resolvedWxidRaw
 
-        if (!resolvedWxidRaw && !resolvedWxid) return
+        if (!resolvedWxidRaw && !resolvedWxid) {
+          window.localStorage.removeItem(SIDEBAR_USER_PROFILE_CACHE_KEY)
+          patchUserProfile({
+            wxid: '',
+            displayName: DEFAULT_DISPLAY_NAME,
+            alias: undefined,
+            avatarUrl: undefined
+          })
+          return
+        }
+
+        setUserProfile((prev) => {
+          if (prev.wxid === resolvedWxid) return prev
+          const seeded: SidebarUserProfile = {
+            wxid: resolvedWxid,
+            displayName: DEFAULT_DISPLAY_NAME,
+            alias: undefined,
+            avatarUrl: undefined
+          }
+          writeSidebarUserProfileCache(seeded)
+          return seeded
+        })
 
         const wxidCandidates = new Set<string>([
           resolvedWxidRaw.toLowerCase(),
@@ -197,14 +206,13 @@ function Sidebar({ collapsed }: SidebarProps) {
         ].filter(Boolean))
 
         const normalizeName = (value?: string | null): string | undefined => {
-          if (!value) return undefined
-          const trimmed = value.trim()
-          if (!trimmed) return undefined
-          const lowered = trimmed.toLowerCase()
+          if (typeof value !== 'string') return undefined
+          if (value.length === 0) return undefined
+          const lowered = value.trim().toLowerCase()
           if (lowered === 'self') return undefined
           if (lowered.startsWith('wxid_')) return undefined
           if (wxidCandidates.has(lowered)) return undefined
-          return trimmed
+          return value
         }
 
         const pickFirstValidName = (...candidates: Array<string | null | undefined>): string | undefined => {
@@ -229,18 +237,20 @@ function Sidebar({ collapsed }: SidebarProps) {
           })(),
           window.electronAPI.chat.getMyAvatarUrl()
         ])
+        if (disposed || seq !== loadSeq) return
 
         const myContact = contactResult.status === 'fulfilled' ? contactResult.value : null
         const displayName = pickFirstValidName(
           myContact?.remark,
           myContact?.nickName,
           myContact?.alias
-        ) || resolvedWxid || '未识别用户'
+        ) || DEFAULT_DISPLAY_NAME
+        const alias = normalizeName(myContact?.alias)
 
         patchUserProfile({
           wxid: resolvedWxid,
           displayName,
-          alias: myContact?.alias,
+          alias,
           avatarUrl: avatarResult.status === 'fulfilled' && avatarResult.value.success
             ? avatarResult.value.avatarUrl
             : undefined
@@ -257,118 +267,28 @@ function Sidebar({ collapsed }: SidebarProps) {
 
     void loadCurrentUser()
     const onWxidChanged = () => { void loadCurrentUser() }
+    const onWindowFocus = () => { void loadCurrentUser() }
+    const onVisibilityChange = () => {
+      if (document.visibilityState === 'visible') {
+        void loadCurrentUser()
+      }
+    }
     window.addEventListener('wxid-changed', onWxidChanged as EventListener)
-    return () => window.removeEventListener('wxid-changed', onWxidChanged as EventListener)
+    window.addEventListener('focus', onWindowFocus)
+    document.addEventListener('visibilitychange', onVisibilityChange)
+    return () => {
+      disposed = true
+      loadSeq += 1
+      window.removeEventListener('wxid-changed', onWxidChanged as EventListener)
+      window.removeEventListener('focus', onWindowFocus)
+      document.removeEventListener('visibilitychange', onVisibilityChange)
+    }
   }, [])
 
   const getAvatarLetter = (name: string): string => {
-    if (!name) return '?'
-    return [...name][0] || '?'
-  }
-
-  const openSwitchAccountDialog = async () => {
-    setIsAccountMenuOpen(false)
-    if (!isDbConnected) {
-      window.alert('数据库未连接，无法切换账号')
-      return
-    }
-    const dbPath = await configService.getDbPath()
-    if (!dbPath) {
-      window.alert('请先在设置中配置数据库路径')
-      return
-    }
-    try {
-      const wxids = await window.electronAPI.dbPath.scanWxids(dbPath)
-      const accountsCache = readAccountProfilesCache()
-      console.log('[切换账号] 账号缓存:', accountsCache)
-
-      const enrichedWxids = wxids.map((option: WxidOption) => {
-        const normalizedWxid = normalizeAccountId(option.wxid)
-        const cached = accountsCache[option.wxid] || accountsCache[normalizedWxid]
-
-        let displayName = option.nickname || option.wxid
-        let avatarUrl = option.avatarUrl
-
-        if (option.wxid === userProfile.wxid || normalizedWxid === userProfile.wxid) {
-          displayName = userProfile.displayName || displayName
-          avatarUrl = userProfile.avatarUrl || avatarUrl
-        }
-
-        else if (cached) {
-          displayName = cached.displayName || displayName
-          avatarUrl = cached.avatarUrl || avatarUrl
-        }
-
-        return {
-          ...option,
-          displayName,
-          avatarUrl
-        }
-      })
-
-      setWxidOptions(enrichedWxids)
-      setShowSwitchAccountDialog(true)
-    } catch (error) {
-      console.error('扫描账号失败:', error)
-      window.alert('扫描账号失败，请稍后重试')
-    }
-  }
-
-  const handleSwitchAccount = async (selectedWxid: string) => {
-    if (!selectedWxid || isSwitchingAccount) return
-    setIsSwitchingAccount(true)
-    try {
-      console.log('[切换账号] 开始切换到:', selectedWxid)
-      const currentWxid = userProfile.wxid
-      if (currentWxid === selectedWxid) {
-        console.log('[切换账号] 已经是当前账号，跳过')
-        setShowSwitchAccountDialog(false)
-        setIsSwitchingAccount(false)
-        return
-      }
-
-      console.log('[切换账号] 设置新 wxid')
-      await configService.setMyWxid(selectedWxid)
-
-      console.log('[切换账号] 获取账号配置')
-      const wxidConfig = await configService.getWxidConfig(selectedWxid)
-      console.log('[切换账号] 配置内容:', wxidConfig)
-      if (wxidConfig?.decryptKey) {
-        console.log('[切换账号] 设置 decryptKey')
-        await configService.setDecryptKey(wxidConfig.decryptKey)
-      }
-      if (typeof wxidConfig?.imageXorKey === 'number') {
-        console.log('[切换账号] 设置 imageXorKey:', wxidConfig.imageXorKey)
-        await configService.setImageXorKey(wxidConfig.imageXorKey)
-      }
-      if (wxidConfig?.imageAesKey) {
-        console.log('[切换账号] 设置 imageAesKey')
-        await configService.setImageAesKey(wxidConfig.imageAesKey)
-      }
-
-      console.log('[切换账号] 检查数据库连接状态')
-      console.log('[切换账号] 数据库连接状态:', isDbConnected)
-      if (isDbConnected) {
-        console.log('[切换账号] 关闭数据库连接')
-        await window.electronAPI.chat.close()
-      }
-
-      console.log('[切换账号] 清除缓存')
-      window.localStorage.removeItem(SIDEBAR_USER_PROFILE_CACHE_KEY)
-      clearAnalyticsStoreCache()
-      resetChatStore()
-
-      console.log('[切换账号] 触发 wxid-changed 事件')
-      window.dispatchEvent(new CustomEvent('wxid-changed', { detail: { wxid: selectedWxid } }))
-
-      console.log('[切换账号] 切换成功')
-      setShowSwitchAccountDialog(false)
-    } catch (error) {
-      console.error('[切换账号] 失败:', error)
-      window.alert('切换账号失败，请稍后重试')
-    } finally {
-      setIsSwitchingAccount(false)
-    }
+    if (!name) return '微'
+    const visible = name.trim()
+    return (visible && [...visible][0]) || '微'
   }
 
   const openSettingsFromAccountMenu = () => {
@@ -378,6 +298,11 @@ function Sidebar({ collapsed }: SidebarProps) {
         backgroundLocation: location
       }
     })
+  }
+
+  const openAccountManagement = () => {
+    setIsAccountMenuOpen(false)
+    navigate('/account-management')
   }
 
   const isActive = (path: string) => {
@@ -429,6 +354,16 @@ function Sidebar({ collapsed }: SidebarProps) {
             <span className="nav-label">通讯录</span>
           </NavLink>
 
+          {/* 资源浏览 */}
+          <NavLink
+            to="/resources"
+            className={`nav-item ${isActive('/resources') ? 'active' : ''}`}
+            title={collapsed ? '资源浏览' : undefined}
+          >
+            <span className="nav-icon"><FolderClosed size={20} /></span>
+            <span className="nav-label">资源浏览</span>
+          </NavLink>
+
           {/* 聊天分析 */}
           <NavLink
             to="/analytics"
@@ -447,6 +382,16 @@ function Sidebar({ collapsed }: SidebarProps) {
           >
             <span className="nav-icon"><FileText size={20} /></span>
             <span className="nav-label">年度报告</span>
+          </NavLink>
+
+          {/* 我的足迹 */}
+          <NavLink
+            to="/footprint"
+            className={`nav-item ${isActive('/footprint') ? 'active' : ''}`}
+            title={collapsed ? '我的足迹' : undefined}
+          >
+            <span className="nav-icon"><Footprints size={20} /></span>
+            <span className="nav-label">我的足迹</span>
           </NavLink>
 
           {/* 导出 */}
@@ -495,12 +440,12 @@ function Sidebar({ collapsed }: SidebarProps) {
             <div className={`sidebar-user-menu ${isAccountMenuOpen ? 'open' : ''}`} role="menu" aria-label="账号菜单">
               <button
                 className="sidebar-user-menu-item"
-                onClick={openSwitchAccountDialog}
+                onClick={openAccountManagement}
                 type="button"
                 role="menuitem"
               >
-                <RefreshCw size={14} />
-                <span>切换账号</span>
+                <Users size={14} />
+                <span>账号管理</span>
               </button>
               <button
                 className="sidebar-user-menu-item"
@@ -514,7 +459,7 @@ function Sidebar({ collapsed }: SidebarProps) {
             </div>
             <div
               className={`sidebar-user-card ${isAccountMenuOpen ? 'menu-open' : ''}`}
-              title={collapsed ? `${userProfile.displayName}${(userProfile.alias || userProfile.wxid) ? `\n${userProfile.alias || userProfile.wxid}` : ''}` : undefined}
+              title={collapsed ? `${userProfile.displayName}${(userProfile.alias) ? `\n${userProfile.alias}` : ''}` : undefined}
               onClick={() => setIsAccountMenuOpen(prev => !prev)}
               role="button"
               tabIndex={0}
@@ -529,8 +474,8 @@ function Sidebar({ collapsed }: SidebarProps) {
                 {userProfile.avatarUrl ? <img src={userProfile.avatarUrl} alt="" /> : <span>{getAvatarLetter(userProfile.displayName)}</span>}
               </div>
               <div className="user-meta">
-                <div className="user-name">{userProfile.displayName}</div>
-                <div className="user-wxid">{userProfile.alias || userProfile.wxid || 'wxid 未识别'}</div>
+                <div className="user-name">{userProfile.displayName || DEFAULT_DISPLAY_NAME}</div>
+                <div className="user-wxid">{userProfile.alias || DEFAULT_SUBTITLE}</div>
               </div>
               {!collapsed && (
                 <span className={`user-menu-caret ${isAccountMenuOpen ? 'open' : ''}`}>
@@ -541,44 +486,6 @@ function Sidebar({ collapsed }: SidebarProps) {
           </div>
         </div>
       </aside>
-
-      {showSwitchAccountDialog && (
-        <div className="sidebar-dialog-overlay" onClick={() => !isSwitchingAccount && setShowSwitchAccountDialog(false)}>
-          <div className="sidebar-dialog" role="dialog" aria-modal="true" onClick={(event) => event.stopPropagation()}>
-            <h3>切换账号</h3>
-            <p>选择要切换的微信账号</p>
-            <div className="sidebar-wxid-list">
-              {wxidOptions.map((option) => (
-                <button
-                  key={option.wxid}
-                  className={`sidebar-wxid-item ${userProfile.wxid === option.wxid ? 'current' : ''}`}
-                  onClick={() => handleSwitchAccount(option.wxid)}
-                  disabled={isSwitchingAccount}
-                  type="button"
-                >
-                  <div className="wxid-avatar">
-                    {option.avatarUrl ? (
-                        <img src={option.avatarUrl} alt="" />
-                    ) : (
-                        <div style={{ width: '100%', height: '100%', display: 'flex', alignItems: 'center', justifyContent: 'center', background: 'var(--bg-tertiary)', borderRadius: '6px', color: 'var(--text-tertiary)' }}>
-                          <UserRound size={16} />
-                        </div>
-                    )}
-                  </div>
-                  <div className="wxid-info">
-                    <div className="wxid-name">{option.displayName}</div>
-                    {option.displayName !== option.wxid && <div className="wxid-id">{option.wxid}</div>}
-                  </div>
-                  {userProfile.wxid === option.wxid && <span className="current-badge">当前</span>}
-                </button>
-              ))}
-            </div>
-            <div className="sidebar-dialog-actions">
-              <button type="button" onClick={() => setShowSwitchAccountDialog(false)} disabled={isSwitchingAccount}>取消</button>
-            </div>
-          </div>
-        </div>
-      )}
     </>
   )
 }

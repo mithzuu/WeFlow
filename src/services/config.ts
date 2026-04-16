@@ -1,6 +1,7 @@
 // 配置服务 - 封装 Electron Store
 import { config } from './ipc'
 import type { ExportDefaultDateRangeConfig } from '../utils/exportDateRange'
+import type { ExportAutomationTask } from '../types/exportAutomation'
 
 // 配置键名
 export const CONFIG_KEYS = {
@@ -30,6 +31,7 @@ export const CONFIG_KEYS = {
   EXPORT_DEFAULT_FORMAT: 'exportDefaultFormat',
   EXPORT_DEFAULT_AVATARS: 'exportDefaultAvatars',
   EXPORT_DEFAULT_DATE_RANGE: 'exportDefaultDateRange',
+  EXPORT_DEFAULT_FILE_NAMING_MODE: 'exportDefaultFileNamingMode',
   EXPORT_DEFAULT_MEDIA: 'exportDefaultMedia',
   EXPORT_DEFAULT_VOICE_AS_TEXT: 'exportDefaultVoiceAsText',
   EXPORT_DEFAULT_EXCEL_COMPACT_COLUMNS: 'exportDefaultExcelCompactColumns',
@@ -47,6 +49,7 @@ export const CONFIG_KEYS = {
   EXPORT_SNS_STATS_CACHE_MAP: 'exportSnsStatsCacheMap',
   EXPORT_SNS_USER_POST_COUNTS_CACHE_MAP: 'exportSnsUserPostCountsCacheMap',
   EXPORT_SESSION_MUTUAL_FRIENDS_CACHE_MAP: 'exportSessionMutualFriendsCacheMap',
+  EXPORT_AUTOMATION_TASK_MAP: 'exportAutomationTaskMap',
   SNS_PAGE_CACHE_MAP: 'snsPageCacheMap',
   CONTACTS_LOAD_TIMEOUT_MS: 'contactsLoadTimeoutMs',
   CONTACTS_LIST_CACHE_MAP: 'contactsListCacheMap',
@@ -71,6 +74,8 @@ export const CONFIG_KEYS = {
   HTTP_API_PORT: 'httpApiPort',
   HTTP_API_HOST: 'httpApiHost',
   MESSAGE_PUSH_ENABLED: 'messagePushEnabled',
+  MESSAGE_PUSH_FILTER_MODE: 'messagePushFilterMode',
+  MESSAGE_PUSH_FILTER_LIST: 'messagePushFilterList',
   WINDOW_CLOSE_BEHAVIOR: 'windowCloseBehavior',
   QUOTE_LAYOUT: 'quoteLayout',
 
@@ -79,7 +84,32 @@ export const CONFIG_KEYS = {
 
   // 数据收集
   ANALYTICS_CONSENT: 'analyticsConsent',
-  ANALYTICS_DENY_COUNT: 'analyticsDenyCount'
+  ANALYTICS_DENY_COUNT: 'analyticsDenyCount',
+
+  // AI 见解
+  AI_MODEL_API_BASE_URL: 'aiModelApiBaseUrl',
+  AI_MODEL_API_KEY: 'aiModelApiKey',
+  AI_MODEL_API_MODEL: 'aiModelApiModel',
+  AI_INSIGHT_ENABLED: 'aiInsightEnabled',
+  AI_INSIGHT_API_BASE_URL: 'aiInsightApiBaseUrl',
+  AI_INSIGHT_API_KEY: 'aiInsightApiKey',
+  AI_INSIGHT_API_MODEL: 'aiInsightApiModel',
+  AI_INSIGHT_SILENCE_DAYS: 'aiInsightSilenceDays',
+  AI_INSIGHT_ALLOW_CONTEXT: 'aiInsightAllowContext',
+  AI_INSIGHT_WHITELIST_ENABLED: 'aiInsightWhitelistEnabled',
+  AI_INSIGHT_WHITELIST: 'aiInsightWhitelist',
+  AI_INSIGHT_COOLDOWN_MINUTES: 'aiInsightCooldownMinutes',
+  AI_INSIGHT_SCAN_INTERVAL_HOURS: 'aiInsightScanIntervalHours',
+  AI_INSIGHT_CONTEXT_COUNT: 'aiInsightContextCount',
+  AI_INSIGHT_SYSTEM_PROMPT: 'aiInsightSystemPrompt',
+  AI_INSIGHT_TELEGRAM_ENABLED: 'aiInsightTelegramEnabled',
+  AI_INSIGHT_TELEGRAM_TOKEN: 'aiInsightTelegramToken',
+  AI_INSIGHT_TELEGRAM_CHAT_IDS: 'aiInsightTelegramChatIds',
+
+  // AI 足迹
+  AI_FOOTPRINT_ENABLED: 'aiFootprintEnabled',
+  AI_FOOTPRINT_SYSTEM_PROMPT: 'aiFootprintSystemPrompt',
+  AI_INSIGHT_DEBUG_LOG_ENABLED: 'aiInsightDebugLogEnabled'
 } as const
 
 export interface WxidConfig {
@@ -96,6 +126,8 @@ export interface ExportDefaultMediaConfig {
   emojis: boolean
   files: boolean
 }
+
+export type ExportFileNamingMode = 'classic' | 'date-range'
 
 export type WindowCloseBehavior = 'ask' | 'tray' | 'quit'
 export type QuoteLayout = 'quote-top' | 'quote-bottom'
@@ -159,6 +191,10 @@ export async function getWxidConfigs(): Promise<Record<string, WxidConfig>> {
     return value as Record<string, WxidConfig>
   }
   return {}
+}
+
+export async function setWxidConfigs(configs: Record<string, WxidConfig>): Promise<void> {
+  await config.set(CONFIG_KEYS.WXID_CONFIGS, configs || {})
 }
 
 export async function getWxidConfig(wxid: string): Promise<WxidConfig | null> {
@@ -417,6 +453,18 @@ export async function setExportDefaultDateRange(range: ExportDefaultDateRangeCon
   await config.set(CONFIG_KEYS.EXPORT_DEFAULT_DATE_RANGE, range)
 }
 
+// 获取导出默认文件命名方式
+export async function getExportDefaultFileNamingMode(): Promise<ExportFileNamingMode | null> {
+  const value = await config.get(CONFIG_KEYS.EXPORT_DEFAULT_FILE_NAMING_MODE)
+  if (value === 'classic' || value === 'date-range') return value
+  return null
+}
+
+// 设置导出默认文件命名方式
+export async function setExportDefaultFileNamingMode(mode: ExportFileNamingMode): Promise<void> {
+  await config.set(CONFIG_KEYS.EXPORT_DEFAULT_FILE_NAMING_MODE, mode)
+}
+
 // 获取导出默认媒体设置
 export async function getExportDefaultMedia(): Promise<ExportDefaultMediaConfig | null> {
   const value = await config.get(CONFIG_KEYS.EXPORT_DEFAULT_MEDIA)
@@ -617,6 +665,183 @@ export async function getExportLastSnsPostCount(): Promise<number> {
 export async function setExportLastSnsPostCount(count: number): Promise<void> {
   const normalized = Number.isFinite(count) ? Math.max(0, Math.floor(count)) : 0
   await config.set(CONFIG_KEYS.EXPORT_LAST_SNS_POST_COUNT, normalized)
+}
+
+export interface ExportAutomationTaskMapItem {
+  updatedAt: number
+  tasks: ExportAutomationTask[]
+}
+
+const normalizeAutomationNumeric = (value: unknown, fallback: number): number => {
+  const numeric = Number(value)
+  if (!Number.isFinite(numeric)) return fallback
+  return Math.floor(numeric)
+}
+
+const normalizeAutomationTask = (raw: unknown): ExportAutomationTask | null => {
+  if (!raw || typeof raw !== 'object') return null
+  const source = raw as Record<string, unknown>
+
+  const id = String(source.id || '').trim()
+  const name = String(source.name || '').trim()
+  if (!id || !name) return null
+
+  const sessionIds = Array.isArray(source.sessionIds)
+    ? Array.from(new Set(source.sessionIds.map((item) => String(item || '').trim()).filter(Boolean)))
+    : []
+  const sessionNames = Array.isArray(source.sessionNames)
+    ? source.sessionNames.map((item) => String(item || '').trim()).filter(Boolean)
+    : []
+  if (sessionIds.length === 0) return null
+
+  const scheduleRaw = source.schedule
+  if (!scheduleRaw || typeof scheduleRaw !== 'object') return null
+  const scheduleObj = scheduleRaw as Record<string, unknown>
+  const scheduleType = String(scheduleObj.type || '').trim() as ExportAutomationTask['schedule']['type']
+  let schedule: ExportAutomationTask['schedule'] | null = null
+  if (scheduleType === 'interval') {
+    const rawDays = Math.max(0, normalizeAutomationNumeric(scheduleObj.intervalDays, 0))
+    const rawHours = Math.max(0, normalizeAutomationNumeric(scheduleObj.intervalHours, 0))
+    const totalHours = (rawDays * 24) + rawHours
+    if (totalHours <= 0) return null
+    const intervalDays = Math.floor(totalHours / 24)
+    const intervalHours = totalHours % 24
+    schedule = { type: 'interval', intervalDays, intervalHours }
+  }
+  if (!schedule) return null
+
+  const conditionRaw = source.condition
+  if (!conditionRaw || typeof conditionRaw !== 'object') return null
+  const conditionType = String((conditionRaw as Record<string, unknown>).type || '').trim()
+  if (conditionType !== 'new-message-since-last-success') return null
+
+  const templateRaw = source.template
+  if (!templateRaw || typeof templateRaw !== 'object') return null
+  const template = templateRaw as Record<string, unknown>
+  const scope = String(template.scope || '').trim() as ExportAutomationTask['template']['scope']
+  if (scope !== 'single' && scope !== 'multi' && scope !== 'content') return null
+  const optionTemplate = template.optionTemplate
+  if (!optionTemplate || typeof optionTemplate !== 'object') return null
+  const dateRangeConfig = template.dateRangeConfig
+  const outputDirRaw = String(source.outputDir || '').trim()
+  const runStateRaw = source.runState && typeof source.runState === 'object'
+    ? (source.runState as Record<string, unknown>)
+    : null
+  const stopConditionRaw = source.stopCondition && typeof source.stopCondition === 'object'
+    ? (source.stopCondition as Record<string, unknown>)
+    : null
+  const rawContentType = String(template.contentType || '').trim()
+  const contentType = (
+    rawContentType === 'text' ||
+    rawContentType === 'voice' ||
+    rawContentType === 'image' ||
+    rawContentType === 'video' ||
+    rawContentType === 'emoji' ||
+    rawContentType === 'file'
+  )
+    ? rawContentType
+    : undefined
+  const rawRunStatus = runStateRaw ? String(runStateRaw.lastRunStatus || '').trim() : ''
+  const lastRunStatus = (
+    rawRunStatus === 'idle' ||
+    rawRunStatus === 'queued' ||
+    rawRunStatus === 'running' ||
+    rawRunStatus === 'success' ||
+    rawRunStatus === 'error' ||
+    rawRunStatus === 'skipped'
+  )
+    ? rawRunStatus
+    : undefined
+  const endAt = stopConditionRaw ? Math.max(0, normalizeAutomationNumeric(stopConditionRaw.endAt, 0)) : 0
+  const maxRuns = stopConditionRaw ? Math.max(0, normalizeAutomationNumeric(stopConditionRaw.maxRuns, 0)) : 0
+
+  return {
+    id,
+    name,
+    enabled: source.enabled !== false,
+    sessionIds,
+    sessionNames,
+    outputDir: outputDirRaw || undefined,
+    schedule,
+    condition: { type: 'new-message-since-last-success' },
+    stopCondition: (endAt > 0 || maxRuns > 0)
+      ? {
+          endAt: endAt > 0 ? endAt : undefined,
+          maxRuns: maxRuns > 0 ? maxRuns : undefined
+        }
+      : undefined,
+    template: {
+      scope,
+      contentType,
+      optionTemplate: optionTemplate as ExportAutomationTask['template']['optionTemplate'],
+      dateRangeConfig: (dateRangeConfig ?? null) as ExportAutomationTask['template']['dateRangeConfig']
+    },
+    runState: runStateRaw
+      ? {
+          lastRunStatus,
+          lastTriggeredAt: normalizeAutomationNumeric(runStateRaw.lastTriggeredAt, 0) || undefined,
+          lastStartedAt: normalizeAutomationNumeric(runStateRaw.lastStartedAt, 0) || undefined,
+          lastFinishedAt: normalizeAutomationNumeric(runStateRaw.lastFinishedAt, 0) || undefined,
+          lastSuccessAt: normalizeAutomationNumeric(runStateRaw.lastSuccessAt, 0) || undefined,
+          lastSkipAt: normalizeAutomationNumeric(runStateRaw.lastSkipAt, 0) || undefined,
+          lastSkipReason: String(runStateRaw.lastSkipReason || '').trim() || undefined,
+          lastError: String(runStateRaw.lastError || '').trim() || undefined,
+          lastScheduleKey: String(runStateRaw.lastScheduleKey || '').trim() || undefined,
+          successCount: Math.max(0, normalizeAutomationNumeric(runStateRaw.successCount, 0)) || undefined
+        }
+      : undefined,
+    createdAt: Math.max(0, normalizeAutomationNumeric(source.createdAt, Date.now())),
+    updatedAt: Math.max(0, normalizeAutomationNumeric(source.updatedAt, Date.now()))
+  }
+}
+
+export async function getExportAutomationTasks(scopeKey: string): Promise<ExportAutomationTaskMapItem | null> {
+  if (!scopeKey) return null
+  const value = await config.get(CONFIG_KEYS.EXPORT_AUTOMATION_TASK_MAP)
+  if (!value || typeof value !== 'object') return null
+  const rawMap = value as Record<string, unknown>
+  const rawItem = rawMap[scopeKey]
+  if (!rawItem || typeof rawItem !== 'object') return null
+
+  const item = rawItem as Record<string, unknown>
+  const updatedAt = Number(item.updatedAt)
+  const rawTasks = Array.isArray(item.tasks)
+    ? item.tasks
+    : (Array.isArray(rawItem) ? rawItem : [])
+  const tasks: ExportAutomationTask[] = []
+  for (const rawTask of rawTasks) {
+    const normalized = normalizeAutomationTask(rawTask)
+    if (normalized) {
+      tasks.push(normalized)
+    }
+  }
+  return {
+    updatedAt: Number.isFinite(updatedAt) ? Math.max(0, Math.floor(updatedAt)) : 0,
+    tasks
+  }
+}
+
+export async function setExportAutomationTasks(scopeKey: string, tasks: ExportAutomationTask[]): Promise<void> {
+  if (!scopeKey) return
+  const current = await config.get(CONFIG_KEYS.EXPORT_AUTOMATION_TASK_MAP)
+  const map = current && typeof current === 'object'
+    ? { ...(current as Record<string, unknown>) }
+    : {}
+  map[scopeKey] = {
+    updatedAt: Date.now(),
+    tasks: (Array.isArray(tasks) ? tasks : []).map((task) => ({ ...task }))
+  }
+  await config.set(CONFIG_KEYS.EXPORT_AUTOMATION_TASK_MAP, map)
+}
+
+export async function clearExportAutomationTasks(scopeKey: string): Promise<void> {
+  if (!scopeKey) return
+  const current = await config.get(CONFIG_KEYS.EXPORT_AUTOMATION_TASK_MAP)
+  if (!current || typeof current !== 'object') return
+  const map = { ...(current as Record<string, unknown>) }
+  if (!(scopeKey in map)) return
+  delete map[scopeKey]
+  await config.set(CONFIG_KEYS.EXPORT_AUTOMATION_TASK_MAP, map)
 }
 
 export interface ExportSessionMessageCountCacheItem {
@@ -1466,6 +1691,29 @@ export async function setMessagePushEnabled(enabled: boolean): Promise<void> {
   await config.set(CONFIG_KEYS.MESSAGE_PUSH_ENABLED, enabled)
 }
 
+export type MessagePushFilterMode = 'all' | 'whitelist' | 'blacklist'
+export type MessagePushSessionType = 'private' | 'group' | 'official' | 'other'
+
+export async function getMessagePushFilterMode(): Promise<MessagePushFilterMode> {
+  const value = await config.get(CONFIG_KEYS.MESSAGE_PUSH_FILTER_MODE)
+  if (value === 'whitelist' || value === 'blacklist') return value
+  return 'all'
+}
+
+export async function setMessagePushFilterMode(mode: MessagePushFilterMode): Promise<void> {
+  await config.set(CONFIG_KEYS.MESSAGE_PUSH_FILTER_MODE, mode)
+}
+
+export async function getMessagePushFilterList(): Promise<string[]> {
+  const value = await config.get(CONFIG_KEYS.MESSAGE_PUSH_FILTER_LIST)
+  return Array.isArray(value) ? value.map(item => String(item || '').trim()).filter(Boolean) : []
+}
+
+export async function setMessagePushFilterList(list: string[]): Promise<void> {
+  const normalized = Array.from(new Set((list || []).map(item => String(item || '').trim()).filter(Boolean)))
+  await config.set(CONFIG_KEYS.MESSAGE_PUSH_FILTER_LIST, normalized)
+}
+
 export async function getWindowCloseBehavior(): Promise<WindowCloseBehavior> {
   const value = await config.get(CONFIG_KEYS.WINDOW_CLOSE_BEHAVIOR)
   if (value === 'tray' || value === 'quit') return value
@@ -1550,4 +1798,201 @@ export async function getHttpApiHost(): Promise<string> {
 
 export async function setHttpApiHost(host: string): Promise<void> {
   await config.set(CONFIG_KEYS.HTTP_API_HOST, host)
+}
+
+// ─── AI 见解 ──────────────────────────────────────────────────────────────────
+
+export async function getAiModelApiBaseUrl(): Promise<string> {
+  const value = await config.get(CONFIG_KEYS.AI_MODEL_API_BASE_URL)
+  if (typeof value === 'string' && value.trim()) return value
+  const legacy = await config.get(CONFIG_KEYS.AI_INSIGHT_API_BASE_URL)
+  return typeof legacy === 'string' ? legacy : ''
+}
+
+export async function setAiModelApiBaseUrl(url: string): Promise<void> {
+  await config.set(CONFIG_KEYS.AI_MODEL_API_BASE_URL, url)
+}
+
+export async function getAiModelApiKey(): Promise<string> {
+  const value = await config.get(CONFIG_KEYS.AI_MODEL_API_KEY)
+  if (typeof value === 'string' && value.trim()) return value
+  const legacy = await config.get(CONFIG_KEYS.AI_INSIGHT_API_KEY)
+  return typeof legacy === 'string' ? legacy : ''
+}
+
+export async function setAiModelApiKey(key: string): Promise<void> {
+  await config.set(CONFIG_KEYS.AI_MODEL_API_KEY, key)
+}
+
+export async function getAiModelApiModel(): Promise<string> {
+  const value = await config.get(CONFIG_KEYS.AI_MODEL_API_MODEL)
+  if (typeof value === 'string' && value.trim()) return value.trim()
+  const legacy = await config.get(CONFIG_KEYS.AI_INSIGHT_API_MODEL)
+  return typeof legacy === 'string' && legacy.trim() ? legacy.trim() : 'gpt-4o-mini'
+}
+
+export async function setAiModelApiModel(model: string): Promise<void> {
+  await config.set(CONFIG_KEYS.AI_MODEL_API_MODEL, model)
+}
+
+export async function getAiInsightEnabled(): Promise<boolean> {
+  const value = await config.get(CONFIG_KEYS.AI_INSIGHT_ENABLED)
+  return value === true
+}
+
+export async function setAiInsightEnabled(enabled: boolean): Promise<void> {
+  await config.set(CONFIG_KEYS.AI_INSIGHT_ENABLED, enabled)
+}
+
+export async function getAiInsightApiBaseUrl(): Promise<string> {
+  return getAiModelApiBaseUrl()
+}
+
+export async function setAiInsightApiBaseUrl(url: string): Promise<void> {
+  await config.set(CONFIG_KEYS.AI_INSIGHT_API_BASE_URL, url)
+  await setAiModelApiBaseUrl(url)
+}
+
+export async function getAiInsightApiKey(): Promise<string> {
+  return getAiModelApiKey()
+}
+
+export async function setAiInsightApiKey(key: string): Promise<void> {
+  await config.set(CONFIG_KEYS.AI_INSIGHT_API_KEY, key)
+  await setAiModelApiKey(key)
+}
+
+export async function getAiInsightApiModel(): Promise<string> {
+  return getAiModelApiModel()
+}
+
+export async function setAiInsightApiModel(model: string): Promise<void> {
+  await config.set(CONFIG_KEYS.AI_INSIGHT_API_MODEL, model)
+  await setAiModelApiModel(model)
+}
+
+export async function getAiInsightSilenceDays(): Promise<number> {
+  const value = await config.get(CONFIG_KEYS.AI_INSIGHT_SILENCE_DAYS)
+  return typeof value === 'number' && value > 0 ? value : 3
+}
+
+export async function setAiInsightSilenceDays(days: number): Promise<void> {
+  await config.set(CONFIG_KEYS.AI_INSIGHT_SILENCE_DAYS, days)
+}
+
+export async function getAiInsightAllowContext(): Promise<boolean> {
+  const value = await config.get(CONFIG_KEYS.AI_INSIGHT_ALLOW_CONTEXT)
+  return value === true
+}
+
+export async function setAiInsightAllowContext(allow: boolean): Promise<void> {
+  await config.set(CONFIG_KEYS.AI_INSIGHT_ALLOW_CONTEXT, allow)
+}
+
+export async function getAiInsightWhitelistEnabled(): Promise<boolean> {
+  const value = await config.get(CONFIG_KEYS.AI_INSIGHT_WHITELIST_ENABLED)
+  return value === true
+}
+
+export async function setAiInsightWhitelistEnabled(enabled: boolean): Promise<void> {
+  await config.set(CONFIG_KEYS.AI_INSIGHT_WHITELIST_ENABLED, enabled)
+}
+
+export async function getAiInsightWhitelist(): Promise<string[]> {
+  const value = await config.get(CONFIG_KEYS.AI_INSIGHT_WHITELIST)
+  return Array.isArray(value) ? (value as string[]) : []
+}
+
+export async function setAiInsightWhitelist(list: string[]): Promise<void> {
+  await config.set(CONFIG_KEYS.AI_INSIGHT_WHITELIST, list)
+}
+
+export async function getAiInsightCooldownMinutes(): Promise<number> {
+  const value = await config.get(CONFIG_KEYS.AI_INSIGHT_COOLDOWN_MINUTES)
+  return typeof value === 'number' && value >= 0 ? value : 120
+}
+
+export async function setAiInsightCooldownMinutes(minutes: number): Promise<void> {
+  await config.set(CONFIG_KEYS.AI_INSIGHT_COOLDOWN_MINUTES, minutes)
+}
+
+export async function getAiInsightScanIntervalHours(): Promise<number> {
+  const value = await config.get(CONFIG_KEYS.AI_INSIGHT_SCAN_INTERVAL_HOURS)
+  return typeof value === 'number' && value > 0 ? value : 4
+}
+
+export async function setAiInsightScanIntervalHours(hours: number): Promise<void> {
+  await config.set(CONFIG_KEYS.AI_INSIGHT_SCAN_INTERVAL_HOURS, hours)
+}
+
+export async function getAiInsightContextCount(): Promise<number> {
+  const value = await config.get(CONFIG_KEYS.AI_INSIGHT_CONTEXT_COUNT)
+  return typeof value === 'number' && value > 0 ? value : 40
+}
+
+export async function setAiInsightContextCount(count: number): Promise<void> {
+  await config.set(CONFIG_KEYS.AI_INSIGHT_CONTEXT_COUNT, count)
+}
+
+export async function getAiInsightSystemPrompt(): Promise<string> {
+  const value = await config.get(CONFIG_KEYS.AI_INSIGHT_SYSTEM_PROMPT)
+  return typeof value === 'string' ? value : ''
+}
+
+export async function setAiInsightSystemPrompt(prompt: string): Promise<void> {
+  await config.set(CONFIG_KEYS.AI_INSIGHT_SYSTEM_PROMPT, prompt)
+}
+
+export async function getAiInsightTelegramEnabled(): Promise<boolean> {
+  const value = await config.get(CONFIG_KEYS.AI_INSIGHT_TELEGRAM_ENABLED)
+  return value === true
+}
+
+export async function setAiInsightTelegramEnabled(enabled: boolean): Promise<void> {
+  await config.set(CONFIG_KEYS.AI_INSIGHT_TELEGRAM_ENABLED, enabled)
+}
+
+export async function getAiInsightTelegramToken(): Promise<string> {
+  const value = await config.get(CONFIG_KEYS.AI_INSIGHT_TELEGRAM_TOKEN)
+  return typeof value === 'string' ? value : ''
+}
+
+export async function setAiInsightTelegramToken(token: string): Promise<void> {
+  await config.set(CONFIG_KEYS.AI_INSIGHT_TELEGRAM_TOKEN, token)
+}
+
+export async function getAiInsightTelegramChatIds(): Promise<string> {
+  const value = await config.get(CONFIG_KEYS.AI_INSIGHT_TELEGRAM_CHAT_IDS)
+  return typeof value === 'string' ? value : ''
+}
+
+export async function setAiInsightTelegramChatIds(chatIds: string): Promise<void> {
+  await config.set(CONFIG_KEYS.AI_INSIGHT_TELEGRAM_CHAT_IDS, chatIds)
+}
+
+export async function getAiFootprintEnabled(): Promise<boolean> {
+  const value = await config.get(CONFIG_KEYS.AI_FOOTPRINT_ENABLED)
+  return value === true
+}
+
+export async function setAiFootprintEnabled(enabled: boolean): Promise<void> {
+  await config.set(CONFIG_KEYS.AI_FOOTPRINT_ENABLED, enabled)
+}
+
+export async function getAiFootprintSystemPrompt(): Promise<string> {
+  const value = await config.get(CONFIG_KEYS.AI_FOOTPRINT_SYSTEM_PROMPT)
+  return typeof value === 'string' ? value : ''
+}
+
+export async function setAiFootprintSystemPrompt(prompt: string): Promise<void> {
+  await config.set(CONFIG_KEYS.AI_FOOTPRINT_SYSTEM_PROMPT, prompt)
+}
+
+export async function getAiInsightDebugLogEnabled(): Promise<boolean> {
+  const value = await config.get(CONFIG_KEYS.AI_INSIGHT_DEBUG_LOG_ENABLED)
+  return value === true
+}
+
+export async function setAiInsightDebugLogEnabled(enabled: boolean): Promise<void> {
+  await config.set(CONFIG_KEYS.AI_INSIGHT_DEBUG_LOG_ENABLED, enabled)
 }

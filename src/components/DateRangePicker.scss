@@ -54,10 +54,11 @@
     position: absolute;
     top: calc(100% + 8px);
     right: 0;
-    background: var(--card-bg);
+    background: var(--bg-secondary-solid, var(--bg-primary, var(--card-bg)));
     border-radius: 16px;
-    box-shadow: 0 8px 32px rgba(0, 0, 0, 0.15);
-    backdrop-filter: blur(20px);
+    box-shadow: 0 8px 32px rgba(0, 0, 0, 0.25);
+    backdrop-filter: none;
+    -webkit-backdrop-filter: none;
     border: 1px solid var(--border-color);
     z-index: 1000;
     display: flex;

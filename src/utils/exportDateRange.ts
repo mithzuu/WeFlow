@@ -138,19 +138,24 @@ export const formatDateInputValue = (date: Date): string => {
   const y = date.getFullYear()
   const m = `${date.getMonth() + 1}`.padStart(2, '0')
   const d = `${date.getDate()}`.padStart(2, '0')
-  return `${y}-${m}-${d}`
+  const h = `${date.getHours()}`.padStart(2, '0')
+  const min = `${date.getMinutes()}`.padStart(2, '0')
+  return `${y}-${m}-${d} ${h}:${min}`
 }
 
 export const parseDateInputValue = (raw: string): Date | null => {
   const text = String(raw || '').trim()
-  const matched = /^(\d{4})-(\d{2})-(\d{2})$/.exec(text)
+  const matched = /^(\d{4})-(\d{2})-(\d{2})(?:\s+(\d{2}):(\d{2}))?$/.exec(text)
   if (!matched) return null
   const year = Number(matched[1])
   const month = Number(matched[2])
   const day = Number(matched[3])
+  const hour = matched[4] !== undefined ? Number(matched[4]) : 0
+  const minute = matched[5] !== undefined ? Number(matched[5]) : 0
   if (!Number.isFinite(year) || !Number.isFinite(month) || !Number.isFinite(day)) return null
   if (month < 1 || month > 12 || day < 1 || day > 31) return null
-  const parsed = new Date(year, month - 1, day)
+  if (hour < 0 || hour > 23 || minute < 0 || minute > 59) return null
+  const parsed = new Date(year, month - 1, day, hour, minute, 0, 0)
   if (
     parsed.getFullYear() !== year ||
     parsed.getMonth() !== month - 1 ||
@@ -291,14 +296,14 @@ export const resolveExportDateRangeConfig = (
   const parsedStart = parseStoredDate(raw.start)
   const parsedEnd = parseStoredDate(raw.end)
   if (parsedStart && parsedEnd) {
-    const start = startOfDay(parsedStart)
-    const end = endOfDay(parsedEnd)
+    const start = parsedStart
+    const end = parsedEnd
     return {
       preset: 'custom',
       useAllTime: false,
       dateRange: {
         start,
-        end: end < start ? endOfDay(start) : end
+        end: end < start ? start : end
       }
     }
   }

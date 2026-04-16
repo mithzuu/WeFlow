@@ -18,7 +18,7 @@ export interface ElectronAPI {
     respondCloseConfirm: (action: 'tray' | 'quit' | 'cancel') => Promise<boolean>
     openAgreementWindow: () => Promise<boolean>
     completeOnboarding: () => Promise<boolean>
-    openOnboardingWindow: () => Promise<boolean>
+    openOnboardingWindow: (options?: { mode?: 'add-account' }) => Promise<boolean>
     setTitleBarOverlay: (options: { symbolColor: string }) => void
     openVideoPlayerWindow: (videoPath: string, videoWidth?: number, videoHeight?: number) => Promise<void>
     resizeToFitVideo: (videoWidth: number, videoHeight: number) => Promise<void>
@@ -69,7 +69,6 @@ export interface ElectronAPI {
     ignoreUpdate: (version: string) => Promise<{ success: boolean }>
     onDownloadProgress: (callback: (progress: number) => void) => () => void
     onUpdateAvailable: (callback: (info: { version: string; releaseNotes: string }) => void) => () => void
-    checkWayland: () => Promise<boolean>
   }
   notification: {
     show: (data: { title: string; content: string; avatarUrl?: string; sessionId: string }) => Promise<{ success?: boolean; error?: string } | void>
@@ -78,6 +77,7 @@ export interface ElectronAPI {
     ready: () => void
     resize: (width: number, height: number) => void
     onShow: (callback: (event: any, data: any) => void) => () => void
+    onNavigateToSession: (callback: (sessionId: string) => void) => () => void
   }
   log: {
     getPath: () => Promise<string>
@@ -146,7 +146,7 @@ export interface ElectronAPI {
   }
   key: {
     autoGetDbKey: () => Promise<{ success: boolean; key?: string; error?: string; logs?: string[] }>
-    autoGetImageKey: (manualDir?: string, wxid?: string) => Promise<{ success: boolean; xorKey?: number; aesKey?: string; error?: string }>
+    autoGetImageKey: (manualDir?: string, wxid?: string) => Promise<{ success: boolean; xorKey?: number; aesKey?: string; verified?: boolean; error?: string }>
     scanImageKeyFromMemory: (userDir: string) => Promise<{ success: boolean; xorKey?: number; aesKey?: string; error?: string }>
     onDbKeyStatus: (callback: (payload: { message: string; level: number }) => void) => () => void
     onImageKeyStatus: (callback: (payload: { message: string }) => void) => () => void
@@ -343,10 +343,145 @@ export interface ElectronAPI {
     }>
     getMessageDates: (sessionId: string) => Promise<{ success: boolean; dates?: string[]; error?: string }>
     getMessageDateCounts: (sessionId: string) => Promise<{ success: boolean; counts?: Record<string, number>; error?: string }>
+    getResourceMessages: (options?: {
+      sessionId?: string
+      types?: Array<'image' | 'video' | 'voice' | 'file'>
+      beginTimestamp?: number
+      endTimestamp?: number
+      limit?: number
+      offset?: number
+    }) => Promise<{
+      success: boolean
+      items?: Array<Message & {
+        sessionId: string
+        sessionDisplayName?: string
+        resourceType: 'image' | 'video' | 'voice' | 'file'
+      }>
+      total?: number
+      hasMore?: boolean
+      error?: string
+    }>
+    getMediaStream: (options?: {
+      sessionId?: string
+      mediaType?: 'image' | 'video' | 'all'
+      beginTimestamp?: number
+      endTimestamp?: number
+      limit?: number
+      offset?: number
+    }) => Promise<{
+      success: boolean
+      items?: Array<{
+        sessionId: string
+        sessionDisplayName?: string
+        mediaType: 'image' | 'video'
+        localId: number
+        serverId?: string
+        createTime: number
+        localType: number
+        senderUsername?: string
+        isSend?: number | null
+        imageMd5?: string
+        imageDatName?: string
+        videoMd5?: string
+        content?: string
+      }>
+      hasMore?: boolean
+      nextOffset?: number
+      error?: string
+    }>
     resolveVoiceCache: (sessionId: string, msgId: string) => Promise<{ success: boolean; hasCache: boolean; data?: string }>
     getVoiceTranscript: (sessionId: string, msgId: string, createTime?: number) => Promise<{ success: boolean; transcript?: string; error?: string }>
     onVoiceTranscriptPartial: (callback: (payload: { sessionId?: string; msgId: string; createTime?: number; text: string }) => void) => () => void
     getMessage: (sessionId: string, localId: number) => Promise<{ success: boolean; message?: Message; error?: string }>
+    getMyFootprintStats: (
+      beginTimestamp: number,
+      endTimestamp: number,
+      options?: {
+        myWxid?: string
+        privateSessionIds?: string[]
+        groupSessionIds?: string[]
+        mentionLimit?: number
+        privateLimit?: number
+        mentionMode?: 'text_at_me' | string
+      }
+    ) => Promise<{
+      success: boolean
+      data?: {
+        summary: {
+          private_inbound_people: number
+          private_replied_people: number
+          private_outbound_people: number
+          private_reply_rate: number
+          mention_count: number
+          mention_group_count: number
+        }
+        private_sessions: Array<{
+          session_id: string
+          incoming_count: number
+          outgoing_count: number
+          replied: boolean
+          first_incoming_ts: number
+          first_reply_ts: number
+          latest_ts: number
+          anchor_local_id: number
+          anchor_create_time: number
+          displayName?: string
+          avatarUrl?: string
+        }>
+        private_segments: Array<{
+          session_id: string
+          segment_index: number
+          start_ts: number
+          end_ts: number
+          duration_sec: number
+          incoming_count: number
+          outgoing_count: number
+          message_count: number
+          replied: boolean
+          first_incoming_ts: number
+          first_reply_ts: number
+          latest_ts: number
+          anchor_local_id: number
+          anchor_create_time: number
+          displayName?: string
+          avatarUrl?: string
+        }>
+        mentions: Array<{
+          session_id: string
+          local_id: number
+          create_time: number
+          sender_username: string
+          message_content: string
+          source: string
+          sessionDisplayName?: string
+          senderDisplayName?: string
+          senderAvatarUrl?: string
+        }>
+        mention_groups: Array<{
+          session_id: string
+          count: number
+          latest_ts: number
+          displayName?: string
+          avatarUrl?: string
+        }>
+        diagnostics: {
+          truncated: boolean
+          scanned_dbs: number
+          elapsed_ms: number
+        }
+      }
+      error?: string
+    }>
+    exportMyFootprint: (
+      beginTimestamp: number,
+      endTimestamp: number,
+      format: 'csv' | 'json',
+      filePath: string
+    ) => Promise<{
+      success: boolean
+      filePath?: string
+      error?: string
+    }>
     onWcdbChange: (callback: (event: any, data: { type: string; json: string }) => void) => () => void
   }
   biz: {
@@ -357,13 +492,39 @@ export interface ElectronAPI {
 
   image: {
     decrypt: (payload: { sessionId?: string; imageMd5?: string; imageDatName?: string; force?: boolean }) => Promise<{ success: boolean; localPath?: string; liveVideoPath?: string; error?: string }>
-    resolveCache: (payload: { sessionId?: string; imageMd5?: string; imageDatName?: string }) => Promise<{ success: boolean; localPath?: string; hasUpdate?: boolean; liveVideoPath?: string; error?: string }>
-    preload: (payloads: Array<{ sessionId?: string; imageMd5?: string; imageDatName?: string }>) => Promise<boolean>
+    resolveCache: (payload: {
+      sessionId?: string
+      imageMd5?: string
+      imageDatName?: string
+      disableUpdateCheck?: boolean
+      allowCacheIndex?: boolean
+    }) => Promise<{ success: boolean; localPath?: string; hasUpdate?: boolean; liveVideoPath?: string; error?: string }>
+    resolveCacheBatch: (
+      payloads: Array<{ sessionId?: string; imageMd5?: string; imageDatName?: string }>,
+      options?: { disableUpdateCheck?: boolean; allowCacheIndex?: boolean }
+    ) => Promise<{
+      success: boolean
+      rows?: Array<{ success: boolean; localPath?: string; hasUpdate?: boolean; error?: string }>
+      error?: string
+    }>
+    preload: (
+      payloads: Array<{ sessionId?: string; imageMd5?: string; imageDatName?: string }>,
+      options?: { allowDecrypt?: boolean; allowCacheIndex?: boolean }
+    ) => Promise<boolean>
     onUpdateAvailable: (callback: (payload: { cacheKey: string; imageMd5?: string; imageDatName?: string }) => void) => () => void
     onCacheResolved: (callback: (payload: { cacheKey: string; imageMd5?: string; imageDatName?: string; localPath: string }) => void) => () => void
+    onDecryptProgress: (callback: (payload: {
+      cacheKey: string
+      imageMd5?: string
+      imageDatName?: string
+      stage: 'queued' | 'locating' | 'decrypting' | 'writing' | 'done' | 'failed'
+      progress: number
+      status: 'running' | 'done' | 'error'
+      message?: string
+    }) => void) => () => void
   }
   video: {
-    getVideoInfo: (videoMd5: string) => Promise<{
+    getVideoInfo: (videoMd5: string, options?: { includePoster?: boolean; posterFormat?: 'dataUrl' | 'fileUrl' }) => Promise<{
       success: boolean
       exists: boolean
       videoUrl?: string
@@ -881,6 +1042,28 @@ export interface ElectronAPI {
     checkBlockDeleteTrigger: () => Promise<{ success: boolean; installed?: boolean; error?: string }>
     deleteSnsPost: (postId: string) => Promise<{ success: boolean; error?: string }>
     downloadEmoji: (params: { url: string; encryptUrl?: string; aesKey?: string }) => Promise<{ success: boolean; localPath?: string; error?: string }>
+    getCacheMigrationStatus: () => Promise<{
+      success: boolean
+      needed: boolean
+      inProgress?: boolean
+      totalFiles?: number
+      legacyBaseDir?: string
+      currentBaseDir?: string
+      items?: Array<{ label: string; sourceDir: string; targetDir: string; fileCount: number }>
+      error?: string
+    }>
+    startCacheMigration: () => Promise<{ success: boolean; copied?: number; skipped?: number; totalFiles?: number; message?: string; error?: string }>
+    onCacheMigrationProgress: (callback: (payload: {
+      status: 'running' | 'done' | 'error'
+      phase: 'copying' | 'cleanup' | 'done' | 'error'
+      current: number
+      total: number
+      copied: number
+      skipped: number
+      remaining: number
+      message?: string
+      currentItemLabel?: string
+    }) => void) => () => void
   }
   cloud: {
     init: () => Promise<void>
@@ -891,6 +1074,24 @@ export interface ElectronAPI {
     start: (port?: number, host?: string) => Promise<{ success: boolean; port?: number; error?: string }>
     stop: () => Promise<{ success: boolean }>
     status: () => Promise<{ running: boolean; port: number; mediaExportPath: string }>
+  }
+  insight: {
+    testConnection: () => Promise<{ success: boolean; message: string }>
+    getTodayStats: () => Promise<Array<{ sessionId: string; count: number; times: string[] }>>
+    triggerTest: () => Promise<{ success: boolean; message: string }>
+    generateFootprintInsight: (payload: {
+      rangeLabel: string
+      summary: {
+        private_inbound_people?: number
+        private_replied_people?: number
+        private_outbound_people?: number
+        private_reply_rate?: number
+        mention_count?: number
+        mention_group_count?: number
+      }
+      privateSegments?: Array<{ displayName?: string; session_id?: string; incoming_count?: number; outgoing_count?: number; message_count?: number; replied?: boolean }>
+      mentionGroups?: Array<{ displayName?: string; session_id?: string; count?: number }>
+    }) => Promise<{ success: boolean; message: string; insight?: string }>
   }
 }
 
@@ -911,6 +1112,7 @@ export interface ExportOptions {
   exportVoiceAsText?: boolean
   excelCompactColumns?: boolean
   txtColumns?: string[]
+  fileNamingMode?: 'classic' | 'date-range'
   sessionLayout?: 'shared' | 'per-session'
   sessionNameWithTypePrefix?: boolean
   displayNamePreference?: 'group-nickname' | 'remark' | 'nickname'

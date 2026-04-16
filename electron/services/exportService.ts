@@ -92,6 +92,7 @@ export interface ExportOptions {
   dateRange?: { start: number; end: number } | null
   senderUsername?: string
   fileNameSuffix?: string
+  fileNamingMode?: 'classic' | 'date-range'
   exportMedia?: boolean
   exportAvatars?: boolean
   exportImages?: boolean
@@ -254,6 +255,7 @@ async function parallelLimit<T, R>(
 
 class ExportService {
   private configService: ConfigService
+  private runtimeConfig: { dbPath?: string; decryptKey?: string; myWxid?: string } | null = null
   private contactCache: LRUCache<string, { displayName: string; avatarUrl?: string }>
   private inlineEmojiCache: LRUCache<string, string>
   private htmlStyleCache: string | null = null
@@ -293,6 +295,10 @@ class ExportService {
     const error = new Error('导出任务已停止')
     ;(error as Error & { code?: string }).code = this.STOP_ERROR_CODE
     return error
+  }
+
+  setRuntimeConfig(config: { dbPath?: string; decryptKey?: string; myWxid?: string } | null): void {
+    this.runtimeConfig = config
   }
 
   private normalizeSessionIds(sessionIds: string[]): string[] {
@@ -487,6 +493,80 @@ class ExportService {
     } catch {
       return false
     }
+  }
+
+  private sanitizeExportFileNamePart(value: string): string {
+    return String(value || '')
+      .replace(/[<>:"\/\\|?*]/g, '_')
+      .replace(/\.+$/, '')
+      .trim()
+  }
+
+  private normalizeFileNamingMode(value: unknown): 'classic' | 'date-range' {
+    return String(value || '').trim().toLowerCase() === 'date-range' ? 'date-range' : 'classic'
+  }
+
+  private formatDateTokenBySeconds(seconds?: number): string | null {
+    if (!Number.isFinite(seconds) || (seconds || 0) <= 0) return null
+    const date = new Date(Math.floor(Number(seconds)) * 1000)
+    if (Number.isNaN(date.getTime())) return null
+    const y = date.getFullYear()
+    const m = `${date.getMonth() + 1}`.padStart(2, '0')
+    const d = `${date.getDate()}`.padStart(2, '0')
+    return `${y}${m}${d}`
+  }
+
+  private buildDateRangeFileNamePart(dateRange?: { start: number; end: number } | null): string {
+    const start = this.formatDateTokenBySeconds(dateRange?.start)
+    const end = this.formatDateTokenBySeconds(dateRange?.end)
+    if (start && end) {
+      if (start === end) return start
+      return start < end ? `${start}-${end}` : `${end}-${start}`
+    }
+    if (start) return `${start}-至今`
+    if (end) return `截至-${end}`
+    return '全部时间'
+  }
+
+  private buildSessionExportBaseName(
+    sessionId: string,
+    displayName: string,
+    options: ExportOptions
+  ): string {
+    const baseName = this.sanitizeExportFileNamePart(displayName || sessionId) || this.sanitizeExportFileNamePart(sessionId) || 'session'
+    const suffix = this.sanitizeExportFileNamePart(options.fileNameSuffix || '')
+    const namingMode = this.normalizeFileNamingMode(options.fileNamingMode)
+    const parts = [baseName]
+    if (suffix) parts.push(suffix)
+    if (namingMode === 'date-range') {
+      parts.push(this.buildDateRangeFileNamePart(options.dateRange))
+    }
+    return this.sanitizeExportFileNamePart(parts.join('_')) || 'session'
+  }
+
+  private async reserveUniqueOutputPath(preferredPath: string, reservedPaths: Set<string>): Promise<string> {
+    const dir = path.dirname(preferredPath)
+    const ext = path.extname(preferredPath)
+    const base = path.basename(preferredPath, ext)
+
+    for (let attempt = 0; attempt < 10000; attempt += 1) {
+      const candidate = attempt === 0
+        ? preferredPath
+        : path.join(dir, `${base}_${attempt + 1}${ext}`)
+
+      if (reservedPaths.has(candidate)) continue
+
+      const exists = await this.pathExists(candidate)
+      if (reservedPaths.has(candidate)) continue
+      if (exists) continue
+
+      reservedPaths.add(candidate)
+      return candidate
+    }
+
+    const fallback = path.join(dir, `${base}_${Date.now()}${ext}`)
+    reservedPaths.add(fallback)
+    return fallback
   }
 
   private isCloneUnsupportedError(code: string | undefined): boolean {
@@ -1316,9 +1396,9 @@ class ExportService {
   }
 
   private async ensureConnected(): Promise<{ success: boolean; cleanedWxid?: string; error?: string }> {
-    const wxid = this.configService.get('myWxid')
-    const dbPath = this.configService.get('dbPath')
-    const decryptKey = this.configService.get('decryptKey')
+    const wxid = String(this.runtimeConfig?.myWxid || this.configService.get('myWxid') || '').trim()
+    const dbPath = String(this.runtimeConfig?.dbPath || this.configService.get('dbPath') || '').trim()
+    const decryptKey = String(this.runtimeConfig?.decryptKey || this.configService.get('decryptKey') || '').trim()
     if (!wxid) return { success: false, error: '请先在设置页面配置微信ID' }
     if (!dbPath) return { success: false, error: '请先在设置页面配置数据库路径' }
     if (!decryptKey) return { success: false, error: '请先在设置页面配置解密密钥' }
@@ -2039,6 +2119,7 @@ class ExportService {
             }
             return title || '[引用消息]'
           }
+          if (xmlType === '53') return title ? `[接龙] ${title.split(/\r?\n/).map(line => line.trim()).find(Boolean) || title}` : '[接龙]'
           if (xmlType === '5' || xmlType === '49') return title ? `[链接] ${title}` : '[链接]'
 
           // 有 title 就返回 title
@@ -2254,7 +2335,7 @@ class ExportService {
       const referMsgXml = normalized.substring(referMsgStart, referMsgEnd + 11)
       const quoteInfo = this.parseQuoteMessage(normalized)
       const replyText = this.stripSenderPrefix(this.extractXmlValue(normalized, 'title') || '')
-      const quotedPreview = this.formatQuotedReferencePreview(
+      const quotedPreview = quoteInfo.content || this.formatQuotedReferencePreview(
         this.extractXmlValue(referMsgXml, 'content'),
         this.extractXmlValue(referMsgXml, 'type')
       )
@@ -2960,7 +3041,7 @@ class ExportService {
 
       switch (referType) {
         case '1':
-          displayContent = this.sanitizeQuotedContent(referContent)
+          displayContent = this.extractPreferredQuotedText(referMsgXml)
           break
         case '3':
           displayContent = '[图片]'
@@ -2999,6 +3080,76 @@ class ExportService {
     } catch {
       return {}
     }
+  }
+
+  private extractPreferredQuotedText(referMsgXml: string): string {
+    if (!referMsgXml) return ''
+
+    const sources = [this.decodeHtmlEntities(referMsgXml)]
+    const rawMsgSource = this.extractXmlValue(referMsgXml, 'msgsource')
+    if (rawMsgSource) {
+      const decodedMsgSource = this.decodeHtmlEntities(rawMsgSource)
+      if (decodedMsgSource) {
+        sources.push(decodedMsgSource)
+      }
+    }
+
+    const fullContent = this.sanitizeQuotedContent(this.extractXmlValue(sources[0] || referMsgXml, 'content'))
+    const partialText = this.extractPartialQuotedText(sources[0] || referMsgXml, fullContent)
+    if (partialText) return partialText
+
+    const candidateTags = [
+      'selectedcontent',
+      'selectedtext',
+      'selectcontent',
+      'selecttext',
+      'quotecontent',
+      'quotetext',
+      'partcontent',
+      'parttext',
+      'excerpt',
+      'summary',
+      'preview'
+    ]
+
+    for (const source of sources) {
+      for (const tag of candidateTags) {
+        const value = this.sanitizeQuotedContent(this.extractXmlValue(source, tag))
+        if (value) return value
+      }
+    }
+
+    return fullContent
+  }
+
+  private extractPartialQuotedText(xml: string, fullContent: string): string {
+    if (!xml || !fullContent) return ''
+
+    const startChar = this.extractXmlValue(xml, 'start')
+    const endChar = this.extractXmlValue(xml, 'end')
+    const startIndexRaw = this.extractXmlValue(xml, 'startindex')
+    const endIndexRaw = this.extractXmlValue(xml, 'endindex')
+    const startIndex = Number.parseInt(startIndexRaw, 10)
+    const endIndex = Number.parseInt(endIndexRaw, 10)
+
+    if (startChar && endChar) {
+      const startPos = fullContent.indexOf(startChar)
+      if (startPos !== -1) {
+        const endPos = fullContent.indexOf(endChar, startPos + startChar.length - 1)
+        if (endPos !== -1 && endPos >= startPos) {
+          const sliced = fullContent.slice(startPos, endPos + endChar.length).trim()
+          if (sliced) return sliced
+        }
+      }
+    }
+
+    if (Number.isFinite(startIndex) && Number.isFinite(endIndex) && endIndex >= startIndex) {
+      const chars = Array.from(fullContent)
+      const sliced = chars.slice(startIndex, endIndex + 1).join('').trim()
+      if (sliced) return sliced
+    }
+
+    return ''
   }
 
   private extractChatLabReplyToMessageId(content: string): string | undefined {
@@ -3070,6 +3221,8 @@ class ExportService {
       appMsgKind = 'announcement'
     } else if (xmlType === '57' || hasReferMsg || localType === 244813135921) {
       appMsgKind = 'quote'
+    } else if (xmlType === '53') {
+      appMsgKind = 'solitaire'
     } else if (xmlType === '5' || xmlType === '49') {
       appMsgKind = 'link'
     } else if (looksLikeAppMsg) {
@@ -6416,9 +6569,12 @@ class ExportService {
       currentRow++
 
       // 表头行
+      const includeGroupNicknameColumn = !useCompactColumns && isGroup
       const headers = useCompactColumns
         ? ['序号', '时间', '发送者身份', '消息类型', '内容']
-        : ['序号', '时间', '发送者昵称', '发送者微信ID', '发送者备注', '群昵称', '发送者身份', '消息类型', '内容']
+        : includeGroupNicknameColumn
+          ? ['序号', '时间', '发送者昵称', '发送者微信ID', '发送者备注', '群昵称', '发送者身份', '消息类型', '内容']
+          : ['序号', '时间', '发送者昵称', '发送者微信ID', '发送者备注', '发送者身份', '消息类型', '内容']
       const headerRow = worksheet.getRow(currentRow)
       headerRow.height = 22
 
@@ -6446,10 +6602,16 @@ class ExportService {
         worksheet.getColumn(3).width = 18  // 发送者昵称
         worksheet.getColumn(4).width = 25  // 发送者微信ID
         worksheet.getColumn(5).width = 18  // 发送者备注
-        worksheet.getColumn(6).width = 18  // 群昵称
-        worksheet.getColumn(7).width = 15  // 发送者身份
-        worksheet.getColumn(8).width = 12  // 消息类型
-        worksheet.getColumn(9).width = 50  // 内容
+        if (includeGroupNicknameColumn) {
+          worksheet.getColumn(6).width = 18  // 群昵称
+          worksheet.getColumn(7).width = 15  // 发送者身份
+          worksheet.getColumn(8).width = 12  // 消息类型
+          worksheet.getColumn(9).width = 50  // 内容
+        } else {
+          worksheet.getColumn(6).width = 15  // 发送者身份
+          worksheet.getColumn(7).width = 12  // 消息类型
+          worksheet.getColumn(8).width = 50  // 内容
+        }
       }
 
       // 预加载群昵称 (仅群聊且完整列模式)
@@ -6730,7 +6892,7 @@ class ExportService {
           enrichedContentValue = this.buildQuotedReplyText(quotedReplyDisplay)
         }
 
-        const contentCellIndex = useCompactColumns ? 5 : 9
+        const contentCellIndex = useCompactColumns ? 5 : (includeGroupNicknameColumn ? 9 : 8)
         const contentCell = worksheet.getCell(currentRow, contentCellIndex)
 
         worksheet.getCell(currentRow, 1).value = i + 1
@@ -6738,13 +6900,19 @@ class ExportService {
         if (useCompactColumns) {
           worksheet.getCell(currentRow, 3).value = senderRole
           worksheet.getCell(currentRow, 4).value = this.getMessageTypeName(msg.localType)
-        } else {
+        } else if (includeGroupNicknameColumn) {
           worksheet.getCell(currentRow, 3).value = senderNickname
           worksheet.getCell(currentRow, 4).value = senderWxid
           worksheet.getCell(currentRow, 5).value = senderRemark
           worksheet.getCell(currentRow, 6).value = senderGroupNickname
           worksheet.getCell(currentRow, 7).value = senderRole
           worksheet.getCell(currentRow, 8).value = this.getMessageTypeName(msg.localType)
+        } else {
+          worksheet.getCell(currentRow, 3).value = senderNickname
+          worksheet.getCell(currentRow, 4).value = senderWxid
+          worksheet.getCell(currentRow, 5).value = senderRemark
+          worksheet.getCell(currentRow, 6).value = senderRole
+          worksheet.getCell(currentRow, 7).value = this.getMessageTypeName(msg.localType)
         }
         contentCell.value = enrichedContentValue
         if (!quotedReplyDisplay) {
@@ -6854,6 +7022,7 @@ class ExportService {
       })
       const worksheet = workbook.addWorksheet('聊天记录')
       const useCompactColumns = options.excelCompactColumns === true
+      const includeGroupNicknameColumn = !useCompactColumns && isGroup
       const senderProfileCache = new Map<string, ExportDisplayProfile>()
 
       worksheet.columns = useCompactColumns
@@ -6864,17 +7033,28 @@ class ExportService {
           { width: 12 },
           { width: 50 }
         ]
-        : [
-          { width: 8 },
-          { width: 20 },
-          { width: 18 },
-          { width: 25 },
-          { width: 18 },
-          { width: 18 },
-          { width: 15 },
-          { width: 12 },
-          { width: 50 }
-        ]
+        : includeGroupNicknameColumn
+          ? [
+            { width: 8 },
+            { width: 20 },
+            { width: 18 },
+            { width: 25 },
+            { width: 18 },
+            { width: 18 },
+            { width: 15 },
+            { width: 12 },
+            { width: 50 }
+          ]
+          : [
+            { width: 8 },
+            { width: 20 },
+            { width: 18 },
+            { width: 25 },
+            { width: 18 },
+            { width: 15 },
+            { width: 12 },
+            { width: 50 }
+          ]
 
       const appendRow = (values: any[]) => {
         const row = worksheet.addRow(values)
@@ -6887,7 +7067,9 @@ class ExportService {
       appendRow([])
       appendRow(useCompactColumns
         ? ['序号', '时间', '发送者身份', '消息类型', '内容']
-        : ['序号', '时间', '发送者昵称', '发送者微信ID', '发送者备注', '群昵称', '发送者身份', '消息类型', '内容'])
+        : includeGroupNicknameColumn
+          ? ['序号', '时间', '发送者昵称', '发送者微信ID', '发送者备注', '群昵称', '发送者身份', '消息类型', '内容']
+          : ['序号', '时间', '发送者昵称', '发送者微信ID', '发送者备注', '发送者身份', '消息类型', '内容'])
 
       for (let i = 0; i < totalMessages; i++) {
         if ((i & 0x7f) === 0) this.throwIfStopRequested(control)
@@ -7002,19 +7184,34 @@ class ExportService {
             this.getMessageTypeName(msg.localType),
             enrichedContentValue
           ]
-          : [
-            i + 1,
-            this.formatTimestamp(msg.createTime),
-            senderNickname,
-            senderWxid,
-            senderRemark,
-            senderGroupNickname,
-            senderRole,
-            this.getMessageTypeName(msg.localType),
-            enrichedContentValue
-          ])
+          : includeGroupNicknameColumn
+            ? [
+              i + 1,
+              this.formatTimestamp(msg.createTime),
+              senderNickname,
+              senderWxid,
+              senderRemark,
+              senderGroupNickname,
+              senderRole,
+              this.getMessageTypeName(msg.localType),
+              enrichedContentValue
+            ]
+            : [
+              i + 1,
+              this.formatTimestamp(msg.createTime),
+              senderNickname,
+              senderWxid,
+              senderRemark,
+              senderRole,
+              this.getMessageTypeName(msg.localType),
+              enrichedContentValue
+            ])
         if (!quotedReplyDisplay) {
-          this.applyExcelLinkCardCell(row.getCell(useCompactColumns ? 5 : 9), msg.content, msg.localType)
+          this.applyExcelLinkCardCell(
+            row.getCell(useCompactColumns ? 5 : (includeGroupNicknameColumn ? 9 : 8)),
+            msg.content,
+            msg.localType
+          )
         }
         row.commit()
 
@@ -8792,6 +8989,7 @@ class ExportService {
         ? path.join(outputDir, 'texts')
         : outputDir
       const createdTaskDirs = new Set<string>()
+      const reservedOutputPaths = new Set<string>()
       const ensureTaskDir = async (dirPath: string) => {
         if (createdTaskDirs.has(dirPath)) return
         await fs.promises.mkdir(dirPath, { recursive: true })
@@ -9040,10 +9238,8 @@ class ExportService {
             phaseLabel: '准备导出'
           })
 
-          const sanitizeName = (value: string) => value.replace(/[<>:"\/\\|?*]/g, '_').replace(/\.+$/, '').trim()
-          const baseName = sanitizeName(sessionInfo.displayName || sessionId) || sanitizeName(sessionId) || 'session'
-          const suffix = sanitizeName(effectiveOptions.fileNameSuffix || '')
-          const safeName = suffix ? `${baseName}_${suffix}` : baseName
+          const fileNamingMode = this.normalizeFileNamingMode(effectiveOptions.fileNamingMode)
+          const safeName = this.buildSessionExportBaseName(sessionId, sessionInfo.displayName, effectiveOptions)
           const sessionNameWithTypePrefix = effectiveOptions.sessionNameWithTypePrefix !== false
           const sessionTypePrefix = sessionNameWithTypePrefix ? await this.getSessionFilePrefix(sessionId) : ''
           const fileNameWithPrefix = `${sessionTypePrefix}${safeName}`
@@ -9061,13 +9257,13 @@ class ExportService {
           else if (effectiveOptions.format === 'txt') ext = '.txt'
           else if (effectiveOptions.format === 'weclone') ext = '.csv'
           else if (effectiveOptions.format === 'html') ext = '.html'
-          const outputPath = path.join(sessionDir, `${fileNameWithPrefix}${ext}`)
+          const preferredOutputPath = path.join(sessionDir, `${fileNameWithPrefix}${ext}`)
           const canTrySkipUnchanged = canTrySkipUnchangedTextSessions &&
             typeof messageCountHint === 'number' &&
             messageCountHint >= 0 &&
             typeof latestTimestampHint === 'number' &&
             latestTimestampHint > 0 &&
-            await this.pathExists(outputPath)
+            await this.pathExists(preferredOutputPath)
           if (canTrySkipUnchanged) {
             const latestRecord = exportRecordService.getLatestRecord(sessionId, effectiveOptions.format)
             const hasNoDataChange = Boolean(
@@ -9093,6 +9289,10 @@ class ExportService {
               return 'done'
             }
           }
+
+          const outputPath = fileNamingMode === 'date-range'
+            ? await this.reserveUniqueOutputPath(preferredOutputPath, reservedOutputPaths)
+            : preferredOutputPath
 
           let result: { success: boolean; error?: string }
           if (effectiveOptions.format === 'json' || effectiveOptions.format === 'arkme-json') {
