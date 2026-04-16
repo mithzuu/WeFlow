@@ -2568,7 +2568,7 @@ function SettingsPage({ onClose }: SettingsPageProps = {}) {
   const getSessionFilterType = (session: { username: string; type?: ContactInfo['type'] | number }): SessionFilterType => {
     const username = String(session.username || '').trim()
     if (username.endsWith('@chatroom')) return 'group'
-    if (username.startsWith('gh_') || session.type === 'official') return 'official'
+    if (username.startsWith('gh_')) return 'official'
     if (username.toLowerCase().includes('placeholder_foldgroup')) return 'other'
     if (session.type === 'former_friend' || session.type === 'other') return 'other'
     return 'private'
@@ -3754,7 +3754,7 @@ function SettingsPage({ onClose }: SettingsPageProps = {}) {
 
       <div className="form-group">
         <label>推送内容</label>
-        <span className="form-hint">SSE 事件名固定为 `message.new`，具体类型看返回 JSON 的 `event` 字段；目前包含 `message.new`、`message.revoke`、`group.invite`，群聊额外附带 `groupName`</span>
+        <span className="form-hint">SSE 事件名固定为 `message.new`，具体类型看返回 JSON 的 `event` 字段；目前包含 `message.new`、`message.revoke`、`group.invite`、`login`，群聊额外附带 `groupName`</span>
         <div className="api-docs">
           <div className="api-item">
             <div className="api-endpoint">

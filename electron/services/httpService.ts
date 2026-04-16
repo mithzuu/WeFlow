@@ -443,6 +443,17 @@ class HttpService {
     })
     res.flushHeaders?.()
     res.write(`event: ready\ndata: ${JSON.stringify({ success: true, stream: this.getMessagePushStreamUrl() })}\n\n`)
+    const createTime = Math.floor(Date.now() / 1000)
+    res.write(`event: message.new\ndata: ${JSON.stringify({
+      event: 'login',
+      sessionId: '',
+      sessionType: 'other',
+      messageKey: `login:connect:${createTime}`,
+      localType: 0,
+      createTime,
+      sourceName: '系统消息',
+      content: 'SSE connected'
+    })}\n\n`)
 
     this.messagePushClients.add(res)
 

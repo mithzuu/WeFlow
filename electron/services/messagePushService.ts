@@ -10,7 +10,7 @@ interface SessionBaseline {
   lastMsgType: number
 }
 
-type MessagePushEventName = 'message.new' | 'message.revoke' | 'group.invite'
+type MessagePushEventName = 'message.new' | 'message.revoke' | 'group.invite' | 'login'
 
 interface MessagePushPayload {
   event: MessagePushEventName
@@ -422,29 +422,42 @@ class MessagePushService {
   }
 
   private isGroupInviteMessage(message: Message): boolean {
+    if (Number(message.localType || 0) !== 10000) {
+      return false
+    }
+
     const rawContent = String(message.rawContent || '')
-    const parsedContent = String(message.parsedContent || '')
     const normalizedRaw = rawContent
       .replace(/<!\[CDATA\[/gi, '')
       .replace(/\]\]>/g, '')
-    const normalizedParsed = parsedContent
-      .replace(/<!\[CDATA\[/gi, '')
-      .replace(/\]\]>/g, '')
+    const normalizedXml = normalizedRaw
+      .replace(/\s+/g, '')
+      .replace(/[“”]/g, '"')
+      .toLowerCase()
 
-    return /:\s*invite\b/i.test(normalizedRaw) || /:\s*invite\b/i.test(normalizedParsed)
+    if (/:\s*invite\b/i.test(normalizedRaw)) {
+      return true
+    }
+
+    return (
+      /你邀请".+"加入了群聊/u.test(normalizedXml)
+      || /".+"通过扫描你分享的二维码加入群聊/u.test(normalizedXml)
+      || /".+"通过扫描".+"分享的二维码加入群聊/u.test(normalizedXml)
+      || /".+"邀请".+"加入了群聊/u.test(normalizedXml)
+    )
   }
 
   private getSessionType(sessionId: string, session: ChatSession): MessagePushPayload['sessionType'] {
     if (sessionId.endsWith('@chatroom')) {
       return 'group'
     }
-    if (sessionId.startsWith('gh_') || session.type === 'official') {
+    if (sessionId.startsWith('gh_')) {
       return 'official'
     }
-    if (session.type === 'friend') {
-      return 'private'
+    if (sessionId.toLowerCase().includes('placeholder_foldgroup')) {
+      return 'other'
     }
-    return 'other'
+    return 'private'
   }
 
   private shouldPushPayload(payload: MessagePushPayload): boolean {

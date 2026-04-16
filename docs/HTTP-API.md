@@ -75,13 +75,15 @@ GET /api/v1/push/messages
 - 同时需要开启 `主动推送`
 - 响应类型为 `text/event-stream`
 - SSE 事件名固定为 `message.new`
-- 具体类型通过返回 JSON 中的 `event` 字段区分，目前包含 `message.new`、`message.revoke`、`group.invite`
+- 具体类型通过返回 JSON 中的 `event` 字段区分，目前包含 `message.new`、`message.revoke`、`group.invite`、`login`
 - 建议接收端按 `messageKey` 去重
+- SSE 建连成功后会立即收到一条 `event=login` 的连接确认事件
 
 ### 事件字段
 
 - `event`
 - `sessionId`
+- `sessionType`
 - `messageKey`
 - `localType`
 - `createTime`
@@ -100,21 +102,28 @@ curl -N "http://127.0.0.1:5031/api/v1/push/messages?access_token=YOUR_TOKEN
 
 ```text
 event: message.new
-data: {"event":"message.new","sessionId":"xxx@chatroom","messageKey":"server:123456:1760000123:1760000123000:321:wxid_member:1","localType":3,"createTime":1760000123,"avatarUrl":"https://example.com/group.jpg","sourceName":"李四","groupName":"项目群","content":"[图片]"}
+data: {"event":"message.new","sessionId":"xxx@chatroom","sessionType":"group","messageKey":"server:123456:1760000123:1760000123000:321:wxid_member:1","localType":3,"createTime":1760000123,"avatarUrl":"https://example.com/group.jpg","sourceName":"李四","groupName":"项目群","content":"[图片]"}
 ```
 
 撤回事件示例：
 
 ```text
 event: message.new
-data: {"event":"message.revoke","sessionId":"xxx@chatroom","messageKey":"local:10002:1760000200:1760000200:998","localType":10002,"createTime":1760000200,"avatarUrl":"https://example.com/group.jpg","sourceName":"李四","groupName":"项目群","content":"李四撤回了一条消息"}
+data: {"event":"message.revoke","sessionId":"xxx@chatroom","sessionType":"group","messageKey":"local:10002:1760000200:1760000200:998","localType":10002,"createTime":1760000200,"avatarUrl":"https://example.com/group.jpg","sourceName":"李四","groupName":"项目群","content":"李四撤回了一条消息"}
 ```
 
 邀请入群事件示例：
 
 ```text
 event: message.new
-data: {"event":"group.invite","sessionId":"xxx@chatroom","messageKey":"local:10000:1760000300:1760000300:1001","localType":10000,"createTime":1760000300,"avatarUrl":"https://example.com/group.jpg","sourceName":"系统消息","groupName":"项目群","content":"张三邀请你加入了群聊"}
+data: {"event":"group.invite","sessionId":"xxx@chatroom","sessionType":"group","messageKey":"local:10000:1760000300:1760000300:1001","localType":10000,"createTime":1760000300,"avatarUrl":"https://example.com/group.jpg","sourceName":"系统消息","groupName":"项目群","content":"张三邀请你加入了群聊"}
+```
+
+连接成功事件示例：
+
+```text
+event: message.new
+data: {"event":"login","sessionId":"","sessionType":"other","messageKey":"login:connect:1760000000","localType":0,"createTime":1760000000,"sourceName":"系统消息","content":"SSE connected"}
 ```
 
 ---
