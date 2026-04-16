@@ -2616,7 +2616,7 @@ function SettingsPage({ onClose }: SettingsPageProps = {}) {
 
       <div className="form-group">
         <label>推送内容</label>
-        <span className="form-hint">SSE 事件名为 `message.new`；私聊推送 `avatarUrl/sourceName/content`，群聊额外附带 `groupName`</span>
+        <span className="form-hint">SSE 事件名固定为 `message.new`，具体类型看返回 JSON 的 `event` 字段；目前包含 `message.new`、`message.revoke`、`group.invite`，群聊额外附带 `groupName`</span>
         <div className="api-docs">
           <div className="api-item">
             <div className="api-endpoint">

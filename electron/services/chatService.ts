@@ -5409,13 +5409,55 @@ class ChatService {
   }
 
   private cleanSystemMessage(content: string): string {
-    // 移除 XML 声明
-    let cleaned = content.replace(/<\?xml[^?]*\?>/gi, '')
-    // 移除所有 XML/HTML 标签
-    cleaned = cleaned.replace(/<[^>]+>/g, '')
-    // 移除尾部的数字（如撤回消息后的时间戳）
+    if (!content) return '[系统消息]'
+
+    const original = this.decodeHtmlEntities(this.cleanUtf16(content))
+
+    const sysmsgTextMatch = /<sysmsg[^>]*>([\s\S]*?)<\/sysmsg>/i.exec(original)
+    const sysmsgContent = sysmsgTextMatch ? sysmsgTextMatch[1] : original
+
+    const revokeMatch = /<replacemsg><!\[CDATA\[(.*?)\]\]><\/replacemsg>/i.exec(sysmsgContent)
+    if (revokeMatch?.[1]) {
+      return revokeMatch[1].trim()
+    }
+
+    const templateMatch = /<template><!\[CDATA\[(.*?)\]\]><\/template>/i.exec(sysmsgContent)
+    if (templateMatch?.[1]) {
+      const rendered = templateMatch[1].replace(/\$\{([^}]+)\}/g, (_, varName) => {
+        const cdataMatch = new RegExp(`<${varName}><!\\[CDATA\\[([\\s\\S]*?)\\]\\]><\\/${varName}>`, 'i').exec(sysmsgContent)
+        if (cdataMatch?.[1]) return cdataMatch[1].trim()
+        const plainMatch = new RegExp(`<${varName}>([\\s\\S]*?)<\\/${varName}>`, 'i').exec(sysmsgContent)
+        return plainMatch?.[1]?.trim?.() || ''
+      })
+      const cleanedTemplate = rendered
+        .replace(/<[^>]+>/g, '')
+        .replace(/\s+/g, ' ')
+        .trim()
+      if (cleanedTemplate) {
+        return cleanedTemplate
+      }
+    }
+
+    const titleMatch = /<title>([\s\S]*?)<\/title>/i.exec(sysmsgContent)
+    if (titleMatch?.[1]) {
+      const title = titleMatch[1].replace(/<!\[CDATA\[/g, '').replace(/\]\]>/g, '').trim()
+      if (title) return title
+    }
+
+    const normalizedText = sysmsgContent
+      .replace(/<!\[CDATA\[/g, '')
+      .replace(/\]\]>/g, '')
+
+    if (/:\s*invite\b/i.test(normalizedText)) {
+      return '[群系统消息] 有人加入了群聊'
+    }
+
+    if (/:\s*(quit|leave|remove)\b/i.test(normalizedText)) {
+      return '[群系统消息] 有人退出了群聊'
+    }
+
+    let cleaned = normalizedText.replace(/<[^>]+>/g, '')
     cleaned = cleaned.replace(/\d+\s*$/, '')
-    // 清理多余空白
     cleaned = cleaned.replace(/\s+/g, ' ').trim()
     return cleaned || '[系统消息]'
   }

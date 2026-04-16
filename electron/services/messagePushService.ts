@@ -6,12 +6,18 @@ import { httpService } from './httpService'
 interface SessionBaseline {
   lastTimestamp: number
   unreadCount: number
+  summary: string
+  lastMsgType: number
 }
 
+type MessagePushEventName = 'message.new' | 'message.revoke' | 'group.invite'
+
 interface MessagePushPayload {
-  event: 'message.new'
+  event: MessagePushEventName
   sessionId: string
   messageKey: string
+  localType: number
+  createTime: number
   avatarUrl?: string
   sourceName: string
   groupName?: string
@@ -33,11 +39,13 @@ class MessagePushService {
   private readonly debounceMs = 350
   private readonly recentMessageTtlMs = 10 * 60 * 1000
   private readonly groupNicknameCacheTtlMs = 5 * 60 * 1000
+  private readonly systemEventLookbackSec = 10 * 60
   private debounceTimer: ReturnType<typeof setTimeout> | null = null
   private processing = false
   private rerunRequested = false
   private started = false
   private baselineReady = false
+  private systemScanRequested = false
 
   constructor() {
     this.configService = ConfigService.getInstance()
@@ -61,11 +69,17 @@ class MessagePushService {
     }
 
     const tableName = String(payload?.table || '').trim().toLowerCase()
-    if (tableName && tableName !== 'session') {
+    if (tableName === 'session') {
+      this.scheduleSync(false)
       return
     }
 
-    this.scheduleSync()
+    if (tableName) {
+      this.scheduleSync(true)
+      return
+    }
+
+    this.scheduleSync(false)
   }
 
   async handleConfigChanged(key: string): Promise<void> {
@@ -91,6 +105,7 @@ class MessagePushService {
     this.recentMessageKeys.clear()
     this.groupNicknameCache.clear()
     this.baselineReady = false
+    this.systemScanRequested = false
     if (this.debounceTimer) {
       clearTimeout(this.debounceTimer)
       this.debounceTimer = null
@@ -121,7 +136,10 @@ class MessagePushService {
     this.baselineReady = true
   }
 
-  private scheduleSync(): void {
+  private scheduleSync(requestSystemScan: boolean): void {
+    if (requestSystemScan) {
+      this.systemScanRequested = true
+    }
     if (this.debounceTimer) {
       clearTimeout(this.debounceTimer)
     }
@@ -157,21 +175,28 @@ class MessagePushService {
       if (!this.baselineReady) {
         this.setBaseline(sessions)
         this.baselineReady = true
+        this.systemScanRequested = false
         return
       }
 
+      const forceSystemScan = this.systemScanRequested
+      this.systemScanRequested = false
       const previousBaseline = new Map(this.sessionBaseline)
       this.setBaseline(sessions)
 
-      const candidates = sessions.filter((session) => this.shouldInspectSession(previousBaseline.get(session.username), session))
+      const candidates = sessions.filter((session) => (
+        forceSystemScan
+          ? this.shouldInspectSessionForSystemScan(session)
+          : this.shouldInspectSession(previousBaseline.get(session.username), session)
+      ))
       for (const session of candidates) {
-        await this.pushSessionMessages(session, previousBaseline.get(session.username))
+        await this.pushSessionMessages(session, previousBaseline.get(session.username), { systemScan: forceSystemScan })
       }
     } finally {
       this.processing = false
       if (this.rerunRequested) {
         this.rerunRequested = false
-        this.scheduleSync()
+        this.scheduleSync(false)
       }
     }
   }
@@ -181,7 +206,9 @@ class MessagePushService {
     for (const session of sessions) {
       this.sessionBaseline.set(session.username, {
         lastTimestamp: Number(session.lastTimestamp || 0),
-        unreadCount: Number(session.unreadCount || 0)
+        unreadCount: Number(session.unreadCount || 0),
+        summary: String(session.summary || '').trim(),
+        lastMsgType: Number(session.lastMsgType || 0)
       })
     }
   }
@@ -193,27 +220,76 @@ class MessagePushService {
     }
 
     const summary = String(session.summary || '').trim()
-    if (Number(session.lastMsgType || 0) === 10002 || summary.includes('撤回了一条消息')) {
-      return false
-    }
-
+    const lastMsgType = Number(session.lastMsgType || 0)
     const lastTimestamp = Number(session.lastTimestamp || 0)
     const unreadCount = Number(session.unreadCount || 0)
+    const immediateSystemEvent = this.isImmediateSystemEventSession(sessionId, summary, lastMsgType)
 
     if (!previous) {
       return unreadCount > 0 && lastTimestamp > 0
+    }
+
+    if (immediateSystemEvent && this.isSessionSummaryChanged(previous, session)) {
+      return true
     }
 
     if (lastTimestamp <= previous.lastTimestamp) {
       return false
     }
 
+    if (immediateSystemEvent) {
+      return true
+    }
+
     // unread 未增长时，大概率是自己发送、其他设备已读或状态同步，不作为主动推送
     return unreadCount > previous.unreadCount
   }
 
-  private async pushSessionMessages(session: ChatSession, previous: SessionBaseline | undefined): Promise<void> {
-    const since = Math.max(0, Number(previous?.lastTimestamp || 0) - 1)
+  private isSessionSummaryChanged(previous: SessionBaseline | undefined, session: ChatSession): boolean {
+    if (!previous) return false
+    const previousSummary = String(previous.summary || '').trim()
+    const currentSummary = String(session.summary || '').trim()
+    const previousLastMsgType = Number(previous.lastMsgType || 0)
+    const currentLastMsgType = Number(session.lastMsgType || 0)
+
+    return previousSummary !== currentSummary || previousLastMsgType !== currentLastMsgType
+  }
+
+  private isImmediateSystemEventSession(sessionId: string, summary: string, lastMsgType: number): boolean {
+    const normalizedSessionId = String(sessionId || '').trim().toLowerCase()
+    const normalizedSummary = String(summary || '').trim().toLowerCase()
+
+    if (lastMsgType === 10002 || normalizedSummary.includes('撤回了一条消息') || normalizedSummary.includes('撤回了消息')) {
+      return true
+    }
+
+    if (!normalizedSessionId.endsWith('@chatroom')) {
+      return false
+    }
+
+    return (
+      normalizedSummary.includes('加入了群聊')
+      || normalizedSummary.includes('加入群聊')
+    )
+  }
+
+  private shouldInspectSessionForSystemScan(session: ChatSession): boolean {
+    const sessionId = String(session.username || '').trim()
+    if (!sessionId || sessionId.toLowerCase().includes('placeholder_foldgroup')) {
+      return false
+    }
+    return true
+  }
+
+  private async pushSessionMessages(
+    session: ChatSession,
+    previous: SessionBaseline | undefined,
+    options?: { systemScan?: boolean }
+  ): Promise<void> {
+    const systemScan = options?.systemScan === true
+    const since = systemScan
+      ? Math.max(0, Math.floor(Date.now() / 1000) - this.systemEventLookbackSec)
+      : Math.max(0, Number(previous?.lastTimestamp || 0) - 1)
     const newMessagesResult = await chatService.getNewMessages(session.username, since, 1000)
     if (!newMessagesResult.success || !newMessagesResult.messages || newMessagesResult.messages.length === 0) {
       return
@@ -222,18 +298,18 @@ class MessagePushService {
     for (const message of newMessagesResult.messages) {
       const messageKey = String(message.messageKey || '').trim()
       if (!messageKey) continue
-      if (message.isSend === 1) continue
-
-      if (previous && Number(message.createTime || 0) < Number(previous.lastTimestamp || 0)) {
-        continue
-      }
-
       if (this.isRecentMessage(messageKey)) {
         continue
       }
 
       const payload = await this.buildPayload(session, message)
       if (!payload) continue
+      if (message.isSend === 1 && payload.event === 'message.new') continue
+      if (systemScan && payload.event === 'message.new') continue
+
+      if (!systemScan && previous && Number(message.createTime || 0) < Number(previous.lastTimestamp || 0)) {
+        continue
+      }
 
       httpService.broadcastMessagePush(payload)
       this.rememberMessageKey(messageKey)
@@ -245,17 +321,20 @@ class MessagePushService {
     const messageKey = String(message.messageKey || '').trim()
     if (!sessionId || !messageKey) return null
 
+    const event = this.resolveEventType(session, message)
     const isGroup = sessionId.endsWith('@chatroom')
     const content = this.getMessageDisplayContent(message)
 
     if (isGroup) {
       const groupInfo = await chatService.getContactAvatar(sessionId)
       const groupName = session.displayName || groupInfo?.displayName || sessionId
-      const sourceName = await this.resolveGroupSourceName(sessionId, message, session)
+      const sourceName = await this.resolveGroupSourceName(sessionId, message, session, event)
       return {
-        event: 'message.new',
+        event,
         sessionId,
         messageKey,
+        localType: Number(message.localType || 0),
+        createTime: Number(message.createTime || 0),
         avatarUrl: session.avatarUrl || groupInfo?.avatarUrl,
         groupName,
         sourceName,
@@ -265,13 +344,53 @@ class MessagePushService {
 
     const contactInfo = await chatService.getContactAvatar(sessionId)
     return {
-      event: 'message.new',
+      event,
       sessionId,
       messageKey,
+      localType: Number(message.localType || 0),
+      createTime: Number(message.createTime || 0),
       avatarUrl: session.avatarUrl || contactInfo?.avatarUrl,
       sourceName: session.displayName || contactInfo?.displayName || sessionId,
       content
     }
+  }
+
+  private resolveEventType(session: ChatSession, message: Message): MessagePushEventName {
+    const localType = Number(message.localType || 0)
+    const rawContent = String(message.rawContent || '')
+    const parsedContent = String(message.parsedContent || '')
+    const normalized = `${rawContent}\n${parsedContent}`.toLowerCase()
+
+    if (
+      localType === 10002
+      || normalized.includes('revokemsg')
+      || normalized.includes('撤回了一条消息')
+      || normalized.includes('撤回了消息')
+    ) {
+      return 'message.revoke'
+    }
+
+    if (
+      String(session.username || '').trim().endsWith('@chatroom')
+      && this.isGroupInviteMessage(message)
+    ) {
+      return 'group.invite'
+    }
+
+    return 'message.new'
+  }
+
+  private isGroupInviteMessage(message: Message): boolean {
+    const rawContent = String(message.rawContent || '')
+    const parsedContent = String(message.parsedContent || '')
+    const normalizedRaw = rawContent
+      .replace(/<!\[CDATA\[/gi, '')
+      .replace(/\]\]>/g, '')
+    const normalizedParsed = parsedContent
+      .replace(/<!\[CDATA\[/gi, '')
+      .replace(/\]\]>/g, '')
+
+    return /:\s*invite\b/i.test(normalizedRaw) || /:\s*invite\b/i.test(normalizedParsed)
   }
 
   private getMessageDisplayContent(message: Message): string | null {
@@ -292,13 +411,30 @@ class MessagePushService {
         return '[位置]'
       case 49:
         return message.linkTitle || message.fileName || '[消息]'
+      case 10002:
+        return message.parsedContent || message.rawContent || '[撤回消息]'
+      case 10000:
+        return message.parsedContent || message.rawContent || '[系统消息]'
       default:
         return message.parsedContent || message.rawContent || null
     }
   }
 
-  private async resolveGroupSourceName(chatroomId: string, message: Message, session: ChatSession): Promise<string> {
+  private async resolveGroupSourceName(
+    chatroomId: string,
+    message: Message,
+    session: ChatSession,
+    event?: MessagePushEventName
+  ): Promise<string> {
     const senderUsername = String(message.senderUsername || '').trim()
+    if (
+      event === 'group.invite' || event === 'message.revoke'
+    ) {
+      if (!senderUsername || senderUsername === chatroomId) {
+        return '系统消息'
+      }
+    }
+
     if (!senderUsername) {
       return session.lastSenderDisplayName || '未知发送者'
     }
