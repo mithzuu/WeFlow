@@ -78,17 +78,22 @@ GET /api/v1/push/messages
 - 具体类型通过返回 JSON 中的 `event` 字段区分，目前包含 `message.new`、`message.revoke`、`group.invite`、`login`
 - 建议接收端按 `messageKey` 去重
 - `messageKey` 中的 `server:...` 段优先使用数据库原始 `server_id` 字符串，避免 64 位消息 ID 精度丢失
+- `message.revoke` 属于系统事件。检测到会话摘要变为“撤回了一条消息”等状态时，会立即补扫并推送撤回事件
 - SSE 建连成功后会立即收到一条 `event=login` 的连接确认事件
 
 ### 事件字段
 
+- `group.invite` 事件使用专用结构，见下方“邀请入群事件示例”
+- 以下字段主要适用于 `message.new`、`message.revoke`、`login`
 - `event`
+- `wxid`：当前账号的微信 ID，便于接收端区分来自哪个登录账号的推送
 - `sessionId`
 - `sessionType`
 - `messageKey`
 - `localType`
 - `createTime`
 - `avatarUrl`
+- `senderUsername`：消息发送者 wxid；私聊通常为会话对端，群聊通常为实际发言人/操作者
 - `sourceName`
 - `groupName`（仅群聊）
 - `content`：消息主显示文本。为兼容旧接入方，该字段仍然始终保留
@@ -120,14 +125,14 @@ curl -N "http://127.0.0.1:5031/api/v1/push/messages?access_token=YOUR_TOKEN
 
 ```text
 event: message.new
-data: {"event":"message.new","sessionId":"xxx@chatroom","sessionType":"group","messageKey":"server:123456:1760000123:1760000123000:321:wxid_member:1","localType":3,"createTime":1760000123,"avatarUrl":"https://example.com/group.jpg","sourceName":"李四","groupName":"项目群","content":"[图片]"}
+data: {"event":"message.new","wxid":"wxid_self","sessionId":"xxx@chatroom","sessionType":"group","messageKey":"server:123456:1760000123:1760000123000:321:wxid_member:1","localType":3,"createTime":1760000123,"avatarUrl":"https://example.com/group.jpg","senderUsername":"wxid_member","sourceName":"李四","groupName":"项目群","content":"[图片]"}
 ```
 
 引用消息示例：
 
 ```text
 event: message.new
-data: {"event":"message.new","sessionId":"wxid_xxx","sessionType":"private","messageKey":"server:123456:1760000400:1760000400000:456:wxid_xxx:49","localType":49,"createTime":1760000400,"avatarUrl":"https://example.com/avatar.jpg","sourceName":"张三","content":"明天下午可以","appMsgKind":"quote","xmlType":"57","rawXml":"<msg><appmsg><type>57</type><title>明天下午可以</title><refermsg>...</refermsg></appmsg></msg>"}
+data: {"event":"message.new","wxid":"wxid_self","sessionId":"wxid_xxx","sessionType":"private","messageKey":"server:123456:1760000400:1760000400000:456:wxid_xxx:49","localType":49,"createTime":1760000400,"avatarUrl":"https://example.com/avatar.jpg","senderUsername":"wxid_xxx","sourceName":"张三","content":"明天下午可以","appMsgKind":"quote","xmlType":"57","rawXml":"<msg><appmsg><type>57</type><title>明天下午可以</title><refermsg>...</refermsg></appmsg></msg>"}
 ```
 
 字段含义：
@@ -139,35 +144,35 @@ data: {"event":"message.new","sessionId":"wxid_xxx","sessionType":"private","mes
 
 ```text
 event: message.new
-data: {"event":"message.new","sessionId":"wxid_xxx","sessionType":"private","messageKey":"server:123456:1760000500:1760000500000:457:wxid_xxx:49","localType":49,"createTime":1760000500,"avatarUrl":"https://example.com/avatar.jpg","sourceName":"张三","content":"腾讯文档","appMsgKind":"miniapp","xmlType":"33","rawXml":"<msg><appmsg><type>33</type><title>腾讯文档</title>...</appmsg></msg>"}
+data: {"event":"message.new","wxid":"wxid_self","sessionId":"wxid_xxx","sessionType":"private","messageKey":"server:123456:1760000500:1760000500000:457:wxid_xxx:49","localType":49,"createTime":1760000500,"avatarUrl":"https://example.com/avatar.jpg","senderUsername":"wxid_xxx","sourceName":"张三","content":"腾讯文档","appMsgKind":"miniapp","xmlType":"33","rawXml":"<msg><appmsg><type>33</type><title>腾讯文档</title>...</appmsg></msg>"}
 ```
 
 表情 XML 示例：
 
 ```text
 event: message.new
-data: {"event":"message.new","sessionId":"wxid_xxx","sessionType":"private","messageKey":"server:123456:1760000600:1760000600000:458:wxid_xxx:47","localType":47,"createTime":1760000600,"avatarUrl":"https://example.com/avatar.jpg","sourceName":"张三","content":"[表情]","rawXml":"<msg><emoji md5=\"...\" cdnurl=\"...\" /></msg>"}
+data: {"event":"message.new","wxid":"wxid_self","sessionId":"wxid_xxx","sessionType":"private","messageKey":"server:123456:1760000600:1760000600000:458:wxid_xxx:47","localType":47,"createTime":1760000600,"avatarUrl":"https://example.com/avatar.jpg","senderUsername":"wxid_xxx","sourceName":"张三","content":"[表情]","rawXml":"<msg><emoji md5=\"...\" cdnurl=\"...\" /></msg>"}
 ```
 
 撤回事件示例：
 
 ```text
 event: message.new
-data: {"event":"message.revoke","sessionId":"xxx@chatroom","sessionType":"group","messageKey":"local:10002:1760000200:1760000200:998","localType":10002,"createTime":1760000200,"avatarUrl":"https://example.com/group.jpg","sourceName":"李四","groupName":"项目群","content":"李四撤回了一条消息"}
+data: {"event":"message.revoke","wxid":"wxid_self","sessionId":"xxx@chatroom","sessionType":"group","messageKey":"server:9876543210123456789:1760000200:1760000200:998:wxid_member:10002","localType":10002,"createTime":1760000200,"avatarUrl":"https://example.com/group.jpg","senderUsername":"wxid_member","sourceName":"李四","groupName":"项目群","content":"李四撤回了一条消息","rawXml":"<sysmsg type=\"revokemsg\"><revokemsg><content>\"李四\" 撤回了一条消息</content><revoketime>0</revoketime></revokemsg></sysmsg>"}
 ```
 
 邀请入群事件示例：
 
 ```text
 event: message.new
-data: {"event":"group.invite","sessionId":"xxx@chatroom","sessionType":"group","messageKey":"local:10000:1760000300:1760000300:1001","localType":10000,"createTime":1760000300,"avatarUrl":"https://example.com/group.jpg","sourceName":"系统消息","groupName":"项目群","content":"张三邀请你加入了群聊"}
+data: {"event":"group.invite","sessionId":"xxx@chatroom","groupName":"项目群","senderUsername":"wxid_inviter","eventMembers":[{"wxid":"wxid_invitee","displayName":"应用展示名","nickname":"微信昵称","remark":"备注","groupNickname":"群昵称","avatarUrl":"https://example.com/avatar.jpg"}]}
 ```
 
 连接成功事件示例：
 
 ```text
 event: message.new
-data: {"event":"login","sessionId":"","sessionType":"other","messageKey":"login:connect:1760000000","localType":0,"createTime":1760000000,"sourceName":"系统消息","content":"SSE connected"}
+data: {"event":"login","wxid":"wxid_self","sessionId":"","sessionType":"other","messageKey":"login:connect:1760000000","localType":0,"createTime":1760000000,"sourceName":"系统消息","content":"SSE connected"}
 ```
 
 ---
@@ -496,6 +501,7 @@ curl "http://127.0.0.1:5031/api/v1/group-members?chatroomId=xxx@chatroom&include
 说明：
 
 - `displayName` 是当前应用内的主展示名。
+- `nickname` 是联系人真实微信昵称。
 - `groupNickname` 是成员在该群里的群昵称。
 - `remark` 是你对该联系人的备注。
 - `alias` 是微信号。

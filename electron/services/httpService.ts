@@ -446,6 +446,7 @@ class HttpService {
     const createTime = Math.floor(Date.now() / 1000)
     res.write(`event: message.new\ndata: ${JSON.stringify({
       event: 'login',
+      wxid: String(this.configService.get('myWxid') || '').trim() || undefined,
       sessionId: '',
       sessionType: 'other',
       messageKey: `login:connect:${createTime}`,
@@ -845,7 +846,7 @@ class HttpService {
         return
       }
 
-      this.sendJson(res, {
+      const responseBody = {
         success: true,
         chatroomId,
         count: result.data.length,
@@ -863,7 +864,9 @@ class HttpService {
           isFriend: Boolean(member.isFriend),
           messageCount: Number.isFinite(member.messageCount) ? member.messageCount : 0
         }))
-      })
+      }
+      //console.log('[HttpService][TEMP][/api/v1/group-members] response:', JSON.stringify(responseBody))
+      this.sendJson(res, responseBody)
     } catch (error) {
       this.sendError(res, 500, String(error))
     }

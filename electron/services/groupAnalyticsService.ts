@@ -269,11 +269,27 @@ class GroupAnalyticsService {
    */
   private async getGroupNicknamesForRoom(chatroomId: string, candidates: string[] = []): Promise<Map<string, string>> {
     try {
+      const merged = new Map<string, string>()
       const dllResult = await wcdbService.getGroupNicknames(chatroomId)
-      if (!dllResult.success || !dllResult.nicknames) {
-        return new Map<string, string>()
+      if (dllResult.success && dllResult.nicknames) {
+        this.mergeGroupNicknameEntries(
+          merged,
+          this.buildTrustedGroupNicknameMap(Object.entries(dllResult.nicknames), candidates).entries()
+        )
       }
-      return this.buildTrustedGroupNicknameMap(Object.entries(dllResult.nicknames), candidates)
+
+      const roomExtResult = await wcdbService.getChatRoomExtBuffer(chatroomId)
+      if (roomExtResult.success && roomExtResult.extBuffer) {
+        const extBuffer = this.decodeExtBuffer(roomExtResult.extBuffer)
+        if (extBuffer) {
+          this.mergeGroupNicknameEntries(
+            merged,
+            this.parseGroupNicknamesFromExtBuffer(extBuffer, candidates).entries()
+          )
+        }
+      }
+
+      return merged
     } catch (e) {
       console.error('getGroupNicknamesForRoom service error:', e)
       return new Map<string, string>()
@@ -510,13 +526,22 @@ class GroupAnalyticsService {
   }
 
   private buildGroupNicknameIdCandidates(values: Array<string | undefined | null>): string[] {
-    const set = new Set<string>()
-    for (const rawValue of values) {
-      const raw = String(rawValue || '').trim()
-      if (!raw) continue
-      set.add(raw)
-    }
-    return Array.from(set)
+    return this.buildIdCandidates(values)
+  }
+
+  private buildGroupMemberIdentityCandidates(
+    wxid: string,
+    originalName?: string,
+    contact?: Partial<GroupMemberContactInfo>
+  ): string[] {
+    return this.buildIdCandidates([
+      wxid,
+      originalName,
+      contact?.username,
+      contact?.userName,
+      contact?.encryptUsername,
+      contact?.encryptUserName
+    ])
   }
 
   private toNonNegativeInteger(value: unknown): number {
@@ -1163,8 +1188,7 @@ class GroupAnalyticsService {
       ...Array.from(contactLookup.values()).map((contact) => contact?.username),
       ...Array.from(contactLookup.values()).map((contact) => contact?.userName),
       ...Array.from(contactLookup.values()).map((contact) => contact?.encryptUsername),
-      ...Array.from(contactLookup.values()).map((contact) => contact?.encryptUserName),
-      ...Array.from(contactLookup.values()).map((contact) => contact?.alias)
+      ...Array.from(contactLookup.values()).map((contact) => contact?.encryptUserName)
     ])
     const groupNicknames = await this.getGroupNicknamesForRoom(chatroomId, nicknameCandidates)
     const myWxid = this.cleanAccountDirName(this.configService.get('myWxid') || '')
@@ -1180,15 +1204,11 @@ class GroupAnalyticsService {
         const remark = contact?.remark || ''
         const alias = contact?.alias || ''
         const normalizedWxid = this.cleanAccountDirName(wxid)
-        const lookupCandidates = this.buildIdCandidates([
+        const lookupCandidates = this.buildGroupMemberIdentityCandidates(
           wxid,
           member.originalName as string | undefined,
-          contact?.username,
-          contact?.userName,
-          contact?.encryptUsername,
-          contact?.encryptUserName,
-          alias
-        ])
+          contact
+        )
         if (normalizedWxid === myWxid) {
           lookupCandidates.push(myWxid)
         }
@@ -1337,8 +1357,7 @@ class GroupAnalyticsService {
         ...Array.from(contactMap.values()).map((c) => c?.username),
         ...Array.from(contactMap.values()).map((c) => c?.userName),
         ...Array.from(contactMap.values()).map((c) => c?.encryptUsername),
-        ...Array.from(contactMap.values()).map((c) => c?.encryptUserName),
-        ...Array.from(contactMap.values()).map((c) => c?.alias)
+        ...Array.from(contactMap.values()).map((c) => c?.encryptUserName)
       ])
       const groupNicknames = await this.getGroupNicknamesForRoom(chatroomId, nicknameCandidates)
 
@@ -1352,15 +1371,7 @@ class GroupAnalyticsService {
         const remark = contact?.remark || ''
         const alias = contact?.alias || ''
         const normalizedWxid = this.cleanAccountDirName(wxid)
-        const lookupCandidates = this.buildIdCandidates([
-          wxid,
-          m.originalName,
-          contact?.username,
-          contact?.userName,
-          contact?.encryptUsername,
-          contact?.encryptUserName,
-          alias
-        ])
+        const lookupCandidates = this.buildGroupMemberIdentityCandidates(wxid, m.originalName, contact)
         if (normalizedWxid === myWxid) {
           lookupCandidates.push(myWxid)
         }

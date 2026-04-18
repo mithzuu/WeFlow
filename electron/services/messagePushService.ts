@@ -12,14 +12,16 @@ interface SessionBaseline {
 
 type MessagePushEventName = 'message.new' | 'message.revoke' | 'group.invite' | 'login'
 
-interface MessagePushPayload {
+interface BaseMessagePushPayload {
   event: MessagePushEventName
+  wxid?: string
   sessionId: string
   sessionType: 'private' | 'group' | 'official' | 'other'
   messageKey: string
   localType: number
   createTime: number
   avatarUrl?: string
+  senderUsername?: string
   sourceName: string
   groupName?: string
   content: string | null
@@ -27,6 +29,25 @@ interface MessagePushPayload {
   xmlType?: string
   rawXml?: string
 }
+
+interface GroupInviteEventMember {
+  wxid: string
+  displayName: string
+  nickname: string
+  remark: string
+  groupNickname: string
+  avatarUrl: string
+}
+
+interface GroupInvitePushPayload {
+  event: 'group.invite'
+  sessionId: string
+  groupName: string
+  senderUsername: string
+  eventMembers: GroupInviteEventMember[]
+}
+
+type MessagePushPayload = BaseMessagePushPayload | GroupInvitePushPayload
 
 const PUSH_CONFIG_KEYS = new Set([
   'messagePushEnabled',
@@ -77,7 +98,7 @@ class MessagePushService {
 
     const tableName = String(payload?.table || '').trim()
     if (this.isSessionTableChange(tableName)) {
-      this.scheduleSync()
+      this.scheduleSync({ scanSystemEvents: true, scanMessageBackedSessions: true })
       return
     }
 
@@ -205,10 +226,18 @@ class MessagePushService {
         return forceSystemScan && this.shouldInspectSessionForSystemScan(session)
       })
       for (const session of candidates) {
+        const sessionId = String(session.username || '').trim()
+        const summary = String(session.summary || '').trim()
+        const lastMsgType = Number(session.lastMsgType || 0)
+        const useSystemScan = forceSystemScan
+          && (
+            sessionId.endsWith('@chatroom')
+            || this.isImmediateSystemEventSession(sessionId, summary, lastMsgType)
+          )
         await this.pushSessionMessages(
           session,
           previousBaseline.get(session.username) || this.sessionBaseline.get(session.username),
-          { systemScan: forceSystemScan }
+          { systemScan: useSystemScan }
         )
       }
     } finally {
@@ -318,7 +347,13 @@ class MessagePushService {
     if (!sessionId || sessionId.toLowerCase().includes('placeholder_foldgroup')) {
       return false
     }
-    return true
+    if (sessionId.endsWith('@chatroom')) {
+      return true
+    }
+
+    const summary = String(session.summary || '').trim()
+    const lastMsgType = Number(session.lastMsgType || 0)
+    return this.isImmediateSystemEventSession(sessionId, summary, lastMsgType)
   }
 
   private async pushSessionMessages(
@@ -345,6 +380,7 @@ class MessagePushService {
       const payload = await this.buildPayload(session, message)
       if (!payload) continue
       if (payload.event === 'message.new' && message.isSend === 1) continue
+      if (payload.event === 'group.invite') continue
       if (!systemScan && previous && Number(message.createTime || 0) <= Number(previous.lastTimestamp || 0)) {
         continue
       }
@@ -363,25 +399,32 @@ class MessagePushService {
     if (!sessionId || !messageKey) return null
 
     const event = this.resolveEventType(session, message)
+    const wxid = String(this.configService.get('myWxid') || '').trim() || undefined
     const isGroup = sessionId.endsWith('@chatroom')
     const sessionType = this.getSessionType(sessionId, session)
     const content = this.getMessageDisplayContent(message)
     const appMsgKind = String(message.appMsgKind || '').trim() || undefined
     const xmlType = String(message.xmlType || '').trim() || undefined
     const rawXml = this.getRawXmlPayload(message)
+    const senderUsername = String(message.senderUsername || '').trim() || undefined
 
     if (isGroup) {
       const groupInfo = await chatService.getContactAvatar(sessionId)
       const groupName = session.displayName || groupInfo?.displayName || sessionId
+      if (event === 'group.invite') {
+        return this.buildGroupInvitePayload(sessionId, groupName, message)
+      }
       const sourceName = await this.resolveGroupSourceName(sessionId, message, session, event)
       return {
         event,
+        wxid,
         sessionId,
         sessionType,
         messageKey,
         localType: Number(message.localType || 0),
         createTime: Number(message.createTime || 0),
         avatarUrl: session.avatarUrl || groupInfo?.avatarUrl,
+        senderUsername,
         groupName,
         sourceName,
         content,
@@ -394,12 +437,14 @@ class MessagePushService {
     const contactInfo = await chatService.getContactAvatar(sessionId)
     return {
       event,
+      wxid,
       sessionId,
       sessionType,
       messageKey,
       localType: Number(message.localType || 0),
       createTime: Number(message.createTime || 0),
       avatarUrl: session.avatarUrl || contactInfo?.avatarUrl,
+      senderUsername,
       sourceName: session.displayName || contactInfo?.displayName || sessionId,
       content,
       appMsgKind,
@@ -433,6 +478,233 @@ class MessagePushService {
     return 'message.new'
   }
 
+  private async buildGroupInvitePayload(
+    sessionId: string,
+    groupName: string,
+    message: Message
+  ): Promise<GroupInvitePushPayload> {
+    const myWxid = String(this.configService.get('myWxid') || '').trim()
+    const fallbackSenderUsername = String(message.senderUsername || '').trim()
+    const rawXml = String(message.rawContent || '')
+    const eventMemberWxids = this.extractInviteMemberWxids(
+      rawXml,
+      sessionId,
+      fallbackSenderUsername,
+      myWxid
+    )
+    const senderUsername = this.extractInviteSenderUsername(
+      rawXml,
+      sessionId,
+      fallbackSenderUsername,
+      eventMemberWxids
+    )
+    const groupNicknames = await this.getGroupNicknames(sessionId)
+    const eventMembers = await Promise.all(
+      eventMemberWxids.map((memberWxid) => this.buildInviteEventMember(memberWxid, sessionId, groupNicknames))
+    )
+
+    return {
+      event: 'group.invite',
+      sessionId,
+      groupName,
+      senderUsername,
+      eventMembers
+    }
+  }
+
+  private extractInviteSenderUsername(
+    rawXml: string,
+    sessionId: string,
+    fallbackSenderUsername?: string,
+    eventMemberWxids: string[] = []
+  ): string {
+    const fallback = this.normalizeInviteMemberCandidate(fallbackSenderUsername || '')
+    if (fallback && fallback !== sessionId && !fallback.endsWith('@chatroom')) {
+      return fallback
+    }
+
+    const normalizedXml = this.decodeXmlEntities(String(rawXml || ''))
+      .replace(/<!\[CDATA\[/gi, '')
+      .replace(/\]\]>/g, '')
+    const eventMemberSet = new Set(
+      (eventMemberWxids || []).map((value) => String(value || '').trim().toLowerCase()).filter(Boolean)
+    )
+
+    const tagNames = [
+      'fromusername',
+      'inviterusername',
+      'sourceusername',
+      'senderusername',
+      'operatorusername',
+      'username'
+    ]
+    for (const tagName of tagNames) {
+      const values = this.extractXmlTagValues(normalizedXml, tagName)
+      for (const value of values) {
+        const normalized = this.normalizeInviteMemberCandidate(value)
+        if (!normalized) continue
+        const lowered = normalized.toLowerCase()
+        if (normalized === sessionId || normalized.endsWith('@chatroom')) continue
+        if (eventMemberSet.has(lowered)) continue
+        return normalized
+      }
+    }
+
+    const attributeRegex = /\b(?:fromusername|inviterusername|sourceusername|senderusername|operatorusername|username)="([^"]+)"/gi
+    for (const match of normalizedXml.matchAll(attributeRegex)) {
+      const normalized = this.normalizeInviteMemberCandidate(match[1])
+      if (!normalized) continue
+      const lowered = normalized.toLowerCase()
+      if (normalized === sessionId || normalized.endsWith('@chatroom')) continue
+      if (eventMemberSet.has(lowered)) continue
+      return normalized
+    }
+
+    return fallback && fallback !== sessionId ? fallback : ''
+  }
+
+  private async buildInviteEventMember(
+    memberWxid: string,
+    chatroomId: string,
+    groupNicknames: Record<string, string>
+  ): Promise<GroupInviteEventMember> {
+    const [contact, avatarInfo] = await Promise.all([
+      chatService.getContact(memberWxid),
+      chatService.getContactAvatar(memberWxid)
+    ])
+    const remark = String(contact?.remark || '').trim()
+    const nickname = String(contact?.nickName || '').trim()
+    const alias = String(contact?.alias || '').trim()
+    const displayName = remark || nickname || alias || avatarInfo?.displayName || memberWxid
+    const groupNickname = String(groupNicknames[String(memberWxid || '').trim().toLowerCase()] || '').trim()
+
+    return {
+      wxid: memberWxid,
+      displayName,
+      nickname,
+      remark,
+      groupNickname,
+      avatarUrl: String(avatarInfo?.avatarUrl || '').trim()
+    }
+  }
+
+  private extractInviteMemberWxids(
+    rawXml: string,
+    sessionId: string,
+    senderUsername?: string,
+    myWxid?: string
+  ): string[] {
+    const normalizedXml = this.decodeXmlEntities(String(rawXml || ''))
+      .replace(/<!\[CDATA\[/gi, '')
+      .replace(/\]\]>/g, '')
+
+    const blacklist = new Set(
+      [sessionId, senderUsername, myWxid]
+        .map((value) => String(value || '').trim().toLowerCase())
+        .filter(Boolean)
+    )
+    const members = new Set<string>()
+    const pushCandidate = (value: string) => {
+      const trimmed = this.normalizeInviteMemberCandidate(value)
+      if (!trimmed) return
+      const lowered = trimmed.toLowerCase()
+      if (blacklist.has(lowered)) return
+      if (trimmed.endsWith('@chatroom')) return
+      members.add(trimmed)
+    }
+    const splitAndPush = (value: string) => {
+      for (const part of String(value || '').split(/[,\s;|]+/)) {
+        pushCandidate(part)
+      }
+    }
+
+    const listTagNames = ['memberlist', 'usernames', 'memberusernames', 'inviteelist', 'members']
+    for (const tagName of listTagNames) {
+      const values = this.extractXmlTagValues(normalizedXml, tagName)
+      for (const value of values) {
+        splitAndPush(value)
+      }
+    }
+
+    const singleTagNames = [
+      'username',
+      'fromusername',
+      'tousername',
+      'memberusername',
+      'inviteeusername',
+      'invitetousername',
+      'linkname'
+    ]
+    for (const tagName of singleTagNames) {
+      const values = this.extractXmlTagValues(normalizedXml, tagName)
+      for (const value of values) {
+        pushCandidate(value)
+      }
+    }
+
+    const attributeRegex = /\b(?:username|memberusername|inviteeusername|invitetousername)="([^"]+)"/gi
+    for (const match of normalizedXml.matchAll(attributeRegex)) {
+      pushCandidate(match[1])
+    }
+
+    const wxidRegex = /\bwxid_[a-z0-9_-]+\b/gi
+    for (const match of normalizedXml.matchAll(wxidRegex)) {
+      pushCandidate(match[0])
+    }
+
+    return Array.from(members)
+  }
+
+  private normalizeInviteMemberCandidate(value: string): string {
+    const decoded = this.decodeXmlEntities(String(value || ''))
+      .replace(/<!\[CDATA\[/gi, '')
+      .replace(/\]\]>/g, '')
+      .trim()
+    if (!decoded) return ''
+
+    const directWxidMatch = decoded.match(/\bwxid_[a-z0-9_-]+\b/i)
+    if (directWxidMatch?.[0]) {
+      return directWxidMatch[0].trim()
+    }
+
+    const stripped = decoded
+      .replace(/<[^>]+>/g, ' ')
+      .replace(/\s+/g, ' ')
+      .trim()
+    if (!stripped) return ''
+
+    const strippedWxidMatch = stripped.match(/\bwxid_[a-z0-9_-]+\b/i)
+    if (strippedWxidMatch?.[0]) {
+      return strippedWxidMatch[0].trim()
+    }
+
+    if (/[<>\s]/.test(stripped)) {
+      return ''
+    }
+
+    return stripped
+  }
+
+  private extractXmlTagValues(xml: string, tagName: string): string[] {
+    if (!xml || !tagName) return []
+    const values: string[] = []
+    const regex = new RegExp(`<${tagName}>([\\s\\S]*?)<\\/${tagName}>`, 'gi')
+    for (const match of xml.matchAll(regex)) {
+      const value = String(match[1] || '').trim()
+      if (value) values.push(value)
+    }
+    return values
+  }
+
+  private decodeXmlEntities(content: string): string {
+    return String(content || '')
+      .replace(/&lt;/gi, '<')
+      .replace(/&gt;/gi, '>')
+      .replace(/&quot;/gi, '"')
+      .replace(/&#39;/gi, "'")
+      .replace(/&amp;/gi, '&')
+  }
+
   private isGroupInviteMessage(message: Message): boolean {
     if (Number(message.localType || 0) !== 10000) {
       return false
@@ -451,12 +723,7 @@ class MessagePushService {
       return true
     }
 
-    return (
-      /你邀请".+"加入了群聊/u.test(normalizedXml)
-      || /".+"通过扫描你分享的二维码加入群聊/u.test(normalizedXml)
-      || /".+"通过扫描".+"分享的二维码加入群聊/u.test(normalizedXml)
-      || /".+"邀请".+"加入了群聊/u.test(normalizedXml)
-    )
+    return normalizedRaw.includes('加入了群聊') || normalizedRaw.includes('加入群聊')
   }
 
   private getSessionType(sessionId: string, session: ChatSession): MessagePushPayload['sessionType'] {
