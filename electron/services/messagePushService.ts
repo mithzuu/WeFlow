@@ -23,6 +23,9 @@ interface MessagePushPayload {
   sourceName: string
   groupName?: string
   content: string | null
+  appMsgKind?: string
+  xmlType?: string
+  rawXml?: string
 }
 
 const PUSH_CONFIG_KEYS = new Set([
@@ -363,6 +366,9 @@ class MessagePushService {
     const isGroup = sessionId.endsWith('@chatroom')
     const sessionType = this.getSessionType(sessionId, session)
     const content = this.getMessageDisplayContent(message)
+    const appMsgKind = String(message.appMsgKind || '').trim() || undefined
+    const xmlType = String(message.xmlType || '').trim() || undefined
+    const rawXml = this.getRawXmlPayload(message)
 
     if (isGroup) {
       const groupInfo = await chatService.getContactAvatar(sessionId)
@@ -378,7 +384,10 @@ class MessagePushService {
         avatarUrl: session.avatarUrl || groupInfo?.avatarUrl,
         groupName,
         sourceName,
-        content
+        content,
+        appMsgKind,
+        xmlType,
+        rawXml
       }
     }
 
@@ -392,7 +401,10 @@ class MessagePushService {
       createTime: Number(message.createTime || 0),
       avatarUrl: session.avatarUrl || contactInfo?.avatarUrl,
       sourceName: session.displayName || contactInfo?.displayName || sessionId,
-      content
+      content,
+      appMsgKind,
+      xmlType,
+      rawXml
     }
   }
 
@@ -551,6 +563,19 @@ class MessagePushService {
       default:
         return cleanOfficialPrefix(message.parsedContent || message.rawContent || null)
     }
+  }
+
+  private getRawXmlPayload(message: Message): string | undefined {
+    const rawContent = String(message.rawContent || '')
+    if (!rawContent) return undefined
+
+    const trimmed = rawContent.trim()
+    if (!trimmed) return undefined
+
+    const isXmlLike = /(?:<|\&lt;)(?:\?xml|msg\b|appmsg\b|emoji\b|img\b|sysmsg\b|voip\b|location\b|msgsource\b)/i.test(trimmed)
+    if (!isXmlLike) return undefined
+
+    return rawContent
   }
 
   private async resolveGroupSourceName(

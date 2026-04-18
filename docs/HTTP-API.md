@@ -77,6 +77,7 @@ GET /api/v1/push/messages
 - SSE 事件名固定为 `message.new`
 - 具体类型通过返回 JSON 中的 `event` 字段区分，目前包含 `message.new`、`message.revoke`、`group.invite`、`login`
 - 建议接收端按 `messageKey` 去重
+- `messageKey` 中的 `server:...` 段优先使用数据库原始 `server_id` 字符串，避免 64 位消息 ID 精度丢失
 - SSE 建连成功后会立即收到一条 `event=login` 的连接确认事件
 
 ### 事件字段
@@ -90,7 +91,24 @@ GET /api/v1/push/messages
 - `avatarUrl`
 - `sourceName`
 - `groupName`（仅群聊）
-- `content`
+- `content`：消息主显示文本。为兼容旧接入方，该字段仍然始终保留
+- `appMsgKind`：复合消息归一化类型，如 `quote` / `link` / `file`
+- `xmlType`：当消息来自 `appmsg` 时的原始子类型，例如引用消息通常为 `57`
+- `rawXml`：当消息本身是 XML 类消息时，附带原始 XML 文本；例如引用消息、小程序、链接卡片、表情 XML、系统 XML 等
+
+### XML 消息处理
+
+接收端如果需要区分引用消息、小程序、链接卡片、点歌 XML 等复杂消息，建议按下面顺序处理：
+
+1. 优先检查 `rawXml` 是否存在。
+2. 如果存在，说明该消息本身是 XML 类消息，建议由接收端按自身需求解析 `rawXml`。
+3. `appMsgKind` 和 `xmlType` 可作为辅助判断字段，但不建议只依赖它们来还原完整消息结构。
+
+兼容说明：
+
+- `content` 仍然保留，适合做通知文案、日志展示、简单分流。
+- 需要拿到完整结构时，请优先解析 `rawXml`。
+- 旧版本接入方如果只读取 `content`，行为不会变化。
 
 ### 示例
 
@@ -103,6 +121,32 @@ curl -N "http://127.0.0.1:5031/api/v1/push/messages?access_token=YOUR_TOKEN
 ```text
 event: message.new
 data: {"event":"message.new","sessionId":"xxx@chatroom","sessionType":"group","messageKey":"server:123456:1760000123:1760000123000:321:wxid_member:1","localType":3,"createTime":1760000123,"avatarUrl":"https://example.com/group.jpg","sourceName":"李四","groupName":"项目群","content":"[图片]"}
+```
+
+引用消息示例：
+
+```text
+event: message.new
+data: {"event":"message.new","sessionId":"wxid_xxx","sessionType":"private","messageKey":"server:123456:1760000400:1760000400000:456:wxid_xxx:49","localType":49,"createTime":1760000400,"avatarUrl":"https://example.com/avatar.jpg","sourceName":"张三","content":"明天下午可以","appMsgKind":"quote","xmlType":"57","rawXml":"<msg><appmsg><type>57</type><title>明天下午可以</title><refermsg>...</refermsg></appmsg></msg>"}
+```
+
+字段含义：
+
+- `content = "明天下午可以"`：当前发送出来的回复正文
+- `rawXml`：完整原始 XML，后台可自行解析 `refermsg`
+
+小程序消息示例：
+
+```text
+event: message.new
+data: {"event":"message.new","sessionId":"wxid_xxx","sessionType":"private","messageKey":"server:123456:1760000500:1760000500000:457:wxid_xxx:49","localType":49,"createTime":1760000500,"avatarUrl":"https://example.com/avatar.jpg","sourceName":"张三","content":"腾讯文档","appMsgKind":"miniapp","xmlType":"33","rawXml":"<msg><appmsg><type>33</type><title>腾讯文档</title>...</appmsg></msg>"}
+```
+
+表情 XML 示例：
+
+```text
+event: message.new
+data: {"event":"message.new","sessionId":"wxid_xxx","sessionType":"private","messageKey":"server:123456:1760000600:1760000600000:458:wxid_xxx:47","localType":47,"createTime":1760000600,"avatarUrl":"https://example.com/avatar.jpg","sourceName":"张三","content":"[表情]","rawXml":"<msg><emoji md5=\"...\" cdnurl=\"...\" /></msg>"}
 ```
 
 撤回事件示例：

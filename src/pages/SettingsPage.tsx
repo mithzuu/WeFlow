@@ -3761,7 +3761,7 @@ function SettingsPage({ onClose }: SettingsPageProps = {}) {
               <span className="method get">GET</span>
               <code>{`http://${httpApiHost}:${httpApiPort}/api/v1/push/messages`}</code>
             </div>
-            <p className="api-desc">通过 SSE 长连接接收消息事件，建议接收端按 `messageKey` 去重。</p>
+            <p className="api-desc">通过 SSE 长连接接收消息事件，建议接收端按 `messageKey` 去重；其中 `server:...` 段优先使用原始 `server_id`。</p>
             <div className="api-params">
               {['event', 'sessionId', 'sessionType', 'messageKey', 'avatarUrl', 'sourceName', 'groupName?', 'content'].map((param) => (
                 <span key={param} className="param">

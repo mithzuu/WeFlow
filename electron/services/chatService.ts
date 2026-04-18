@@ -2273,6 +2273,7 @@ class ChatService {
   private buildMessageKey(input: {
     localId: number
     serverId: number
+    serverIdRaw?: string
     createTime: number
     sortSeq: number
     senderUsername?: string | null
@@ -2283,6 +2284,7 @@ class ChatService {
   }): string {
     const localId = Number.isFinite(input.localId) ? Math.max(0, Math.floor(input.localId)) : 0
     const serverId = Number.isFinite(input.serverId) ? Math.max(0, Math.floor(input.serverId)) : 0
+    const serverIdRaw = this.normalizeUnsignedIntegerToken(input.serverIdRaw)
     const createTime = Number.isFinite(input.createTime) ? Math.max(0, Math.floor(input.createTime)) : 0
     const sortSeq = Number.isFinite(input.sortSeq) ? Math.max(0, Math.floor(input.sortSeq)) : 0
     const localType = Number.isFinite(input.localType) ? Math.floor(input.localType) : 0
@@ -2294,8 +2296,9 @@ class ChatService {
       return `${this.encodeMessageKeySegment(dbName)}:${this.encodeMessageKeySegment(tableName)}:${localId}`
     }
 
-    if (serverId > 0) {
-      return `server:${serverId}:${createTime}:${sortSeq}:${localId}:${senderUsername}:${localType}`
+    const stableServerId = serverIdRaw || (serverId > 0 ? String(serverId) : '')
+    if (stableServerId) {
+      return `server:${stableServerId}:${createTime}:${sortSeq}:${localId}:${senderUsername}:${localType}`
     }
 
     return `fallback:${createTime}:${sortSeq}:${localId}:${senderUsername}:${localType}`
@@ -4430,6 +4433,7 @@ class ChatService {
         messageKey: this.buildMessageKey({
           localId,
           serverId,
+          serverIdRaw,
           createTime,
           sortSeq,
           senderUsername,
@@ -10485,6 +10489,7 @@ class ChatService {
       messageKey: this.buildMessageKey({
         localId,
         serverId,
+        serverIdRaw,
         createTime,
         sortSeq,
         senderUsername,
