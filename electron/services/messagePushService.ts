@@ -230,10 +230,7 @@ class MessagePushService {
         const summary = String(session.summary || '').trim()
         const lastMsgType = Number(session.lastMsgType || 0)
         const useSystemScan = forceSystemScan
-          && (
-            sessionId.endsWith('@chatroom')
-            || this.isImmediateSystemEventSession(sessionId, summary, lastMsgType)
-          )
+          && this.isImmediateSystemEventSession(sessionId, summary, lastMsgType)
         await this.pushSessionMessages(
           session,
           previousBaseline.get(session.username) || this.sessionBaseline.get(session.username),
@@ -347,13 +344,7 @@ class MessagePushService {
     if (!sessionId || sessionId.toLowerCase().includes('placeholder_foldgroup')) {
       return false
     }
-    if (sessionId.endsWith('@chatroom')) {
-      return true
-    }
-
-    const summary = String(session.summary || '').trim()
-    const lastMsgType = Number(session.lastMsgType || 0)
-    return this.isImmediateSystemEventSession(sessionId, summary, lastMsgType)
+    return true
   }
 
   private async pushSessionMessages(
