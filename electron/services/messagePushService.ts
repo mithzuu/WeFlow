@@ -62,8 +62,10 @@ class MessagePushService {
   private readonly configService: ConfigService
   private readonly sessionBaseline = new Map<string, SessionBaseline>()
   private readonly recentMessageKeys = new Map<string, number>()
+  private readonly pendingMessageBackfillSessions = new Set<string>()
   private readonly groupNicknameCache = new Map<string, { nicknames: Record<string, string>; updatedAt: number }>()
   private readonly debounceMs = 350
+  private readonly normalMessageLookbackSec = 1
   private readonly recentMessageTtlMs = 10 * 60 * 1000
   private readonly groupNicknameCacheTtlMs = 5 * 60 * 1000
   private readonly systemEventLookbackSec = 10 * 60
@@ -98,12 +100,12 @@ class MessagePushService {
 
     const tableName = String(payload?.table || '').trim()
     if (this.isSessionTableChange(tableName)) {
-      this.scheduleSync({ scanSystemEvents: true, scanMessageBackedSessions: true })
+      this.scheduleSync()
       return
     }
 
     if (!tableName || this.isMessageTableChange(tableName)) {
-      this.scheduleSync({ scanMessageBackedSessions: true, scanSystemEvents: true })
+      this.scheduleSync({ scanMessageBackedSessions: true })
     }
   }
 
@@ -128,6 +130,7 @@ class MessagePushService {
   private resetRuntimeState(): void {
     this.sessionBaseline.clear()
     this.recentMessageKeys.clear()
+    this.pendingMessageBackfillSessions.clear()
     this.groupNicknameCache.clear()
     this.baselineReady = false
     this.messageTableScanRequested = false
@@ -223,7 +226,7 @@ class MessagePushService {
         if (scanMessageBackedSessions && this.shouldScanMessageBackedSession(previous, session)) {
           return true
         }
-        return forceSystemScan && this.shouldInspectSessionForSystemScan(session)
+        return forceSystemScan && this.shouldInspectSessionForSystemScan(previous, session)
       })
       for (const session of candidates) {
         const sessionId = String(session.username || '').trim()
@@ -301,17 +304,25 @@ class MessagePushService {
       return false
     }
 
+    if (this.pendingMessageBackfillSessions.has(sessionId)) {
+      return true
+    }
+
     const summary = String(session.summary || '').trim()
-    if (Number(session.lastMsgType || 0) === 10002 || summary.includes('撤回了一条消息')) {
+    const lastMsgType = Number(session.lastMsgType || 0)
+    if (this.isImmediateSystemEventSession(sessionId, summary, lastMsgType)) {
+      return true
+    }
+
+    if (!previous) {
       return false
     }
 
-    const sessionType = this.getSessionType(sessionId, session)
-    if (sessionType === 'private') {
-      return false
-    }
-
-    return Boolean(previous) || Number(session.lastTimestamp || 0) > 0
+    return this.isImmediateSystemEventSession(
+      sessionId,
+      String(previous.summary || '').trim(),
+      Number(previous.lastMsgType || 0)
+    )
   }
 
   private isSessionSummaryChanged(previous: SessionBaseline | undefined, session: ChatSession): boolean {
@@ -339,12 +350,27 @@ class MessagePushService {
     return normalizedSummary.includes('加入了群聊') || normalizedSummary.includes('加入群聊')
   }
 
-  private shouldInspectSessionForSystemScan(session: ChatSession): boolean {
+  private shouldInspectSessionForSystemScan(previous: SessionBaseline | undefined, session: ChatSession): boolean {
     const sessionId = String(session.username || '').trim()
     if (!sessionId || sessionId.toLowerCase().includes('placeholder_foldgroup')) {
       return false
     }
-    return true
+
+    const summary = String(session.summary || '').trim()
+    const lastMsgType = Number(session.lastMsgType || 0)
+    if (this.isImmediateSystemEventSession(sessionId, summary, lastMsgType)) {
+      return true
+    }
+
+    if (!previous) {
+      return false
+    }
+
+    return this.isImmediateSystemEventSession(
+      sessionId,
+      String(previous.summary || '').trim(),
+      Number(previous.lastMsgType || 0)
+    )
   }
 
   private async pushSessionMessages(
@@ -352,14 +378,20 @@ class MessagePushService {
     previous: SessionBaseline | undefined,
     options: { systemScan?: boolean } = {}
   ): Promise<void> {
+    const sessionId = String(session.username || '').trim()
     const systemScan = options.systemScan === true
     const since = systemScan
       ? Math.max(0, Math.floor(Date.now() / 1000) - this.systemEventLookbackSec)
-      : Math.max(0, Number(previous?.lastTimestamp || 0))
+      : Math.max(0, Number(previous?.lastTimestamp || 0) - this.normalMessageLookbackSec)
     const newMessagesResult = await chatService.getNewMessages(session.username, since, 1000)
     if (!newMessagesResult.success || !newMessagesResult.messages || newMessagesResult.messages.length === 0) {
+      if (!systemScan && previous && this.shouldInspectSession(previous, session)) {
+        this.pendingMessageBackfillSessions.add(sessionId)
+      }
       return
     }
+
+    this.pendingMessageBackfillSessions.delete(sessionId)
 
     for (const message of newMessagesResult.messages) {
       const messageKey = String(message.messageKey || '').trim()
@@ -372,7 +404,7 @@ class MessagePushService {
       if (!payload) continue
       if (payload.event === 'message.new' && message.isSend === 1) continue
       if (payload.event === 'group.invite') continue
-      if (!systemScan && previous && Number(message.createTime || 0) <= Number(previous.lastTimestamp || 0)) {
+      if (!systemScan && previous && Number(message.createTime || 0) < Number(previous.lastTimestamp || 0)) {
         continue
       }
       if (systemScan && payload.event === 'message.new') continue
